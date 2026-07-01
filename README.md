@@ -6,7 +6,7 @@ your game systems. No cpal/threads to wire up yourself.
 
 ```toml
 [dependencies]
-bevy_tono = { path = "../bevy_tono" }   # or git, once published
+bevy_tono = "0.1"
 ```
 
 That's the only dependency you need — `bevy_tono` re-exports the engine, so
