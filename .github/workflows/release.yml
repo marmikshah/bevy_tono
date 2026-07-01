@@ -1,10 +1,6 @@
 # Release. Pushing a v* tag from clean master (via `make release`) publishes the
 # crate to crates.io. The token lives in the `production` environment secret
 # CRATES_API_TOKEN, scoped to this workflow only.
-#
-# NOTE: publishing requires `tono-core` to be a *versioned* crates.io dependency
-# (not the path dep used for local development) — crates.io rejects path deps.
-# Flip the dep in Cargo.toml before the first `make release`.
 name: Release
 
 on:
