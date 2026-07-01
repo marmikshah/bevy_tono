@@ -9,10 +9,13 @@ your game systems. No cpal/threads to wire up yourself.
 bevy_tono = { path = "../bevy_tono" }   # or git, once published
 ```
 
+That's the only dependency you need — `bevy_tono` re-exports the engine, so
+`SoundDoc` and friends are reachable as `bevy_tono::tono_core::…`.
+
 ```rust
 use bevy::prelude::*;
 use bevy_tono::{Sound, TonoAudio, TonoPlugin};
-use tono_core::dsl::SoundDoc;
+use bevy_tono::tono_core::dsl::SoundDoc;
 
 #[derive(Resource)]
 struct Blip(Sound);

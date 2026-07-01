@@ -9,7 +9,7 @@
 //! ```no_run
 //! use bevy::prelude::*;
 //! use bevy_tono::{TonoAudio, TonoPlugin, Sound};
-//! use tono_core::dsl::SoundDoc;
+//! use bevy_tono::tono_core::dsl::SoundDoc; // re-exported — one dependency
 //!
 //! # fn setup(mut commands: Commands, audio: Res<TonoAudio>) {
 //! let doc: SoundDoc = serde_json::from_str(r#"{ "name":"blip", "duration":0.2,
@@ -35,6 +35,11 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tono_core::adaptive::{AdaptiveMusic, LoopBuffer};
 use tono_core::dsl::SoundDoc;
 use tono_core::runtime::{AudioSource, Engine, InstanceHandle, PatchId, Tween};
+
+/// The engine, re-exported so a downstream game needs only `bevy_tono` as a
+/// dependency — author sounds with [`tono_core::dsl::SoundDoc`] without wiring
+/// up a second crate.
+pub use tono_core;
 
 /// A registered sound — a `SoundDoc` loaded into the engine, ready to play.
 #[derive(Clone, Copy, Debug)]
