@@ -1,0 +1,38 @@
+# Release. Pushing a v* tag from clean master (via `make release`) publishes the
+# crate to crates.io. The token lives in the `production` environment secret
+# CRATES_API_TOKEN, scoped to this workflow only.
+#
+# NOTE: publishing requires `tono-core` to be a *versioned* crates.io dependency
+# (not the path dep used for local development) — crates.io rejects path deps.
+# Flip the dep in Cargo.toml before the first `make release`.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build deps for Bevy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Guard: the tag must match the crate version (v1.2.3 == version = "1.2.3").
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          CRATE_VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$CRATE_VERSION" != "$TAG_VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME != Cargo.toml version $CRATE_VERSION" >&2
+            exit 1
+          fi
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}

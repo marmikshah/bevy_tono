@@ -1,0 +1,25 @@
+[package]
+name = "bevy_tono"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Bevy plugin for the tono sound engine — fire deterministic SFX and drive adaptive music straight from your game systems."
+repository = "https://github.com/marmikshah/bevy_tono"
+keywords = ["bevy", "audio", "sound", "gamedev", "synthesis"]
+categories = ["game-development", "multimedia::audio"]
+
+# The lib asks for the MINIMAL bevy surface (App/ECS only) — the game brings its
+# own bevy with its own features and cargo unifies. Keeping render/winit out of
+# here means we don't dictate a platform stack to downstream games.
+[dependencies]
+bevy = { version = "0.19", default-features = false, features = ["std"] }
+tono-core = { path = "../../sonarium/crates/tono-core" }
+cpal = "0.15.3"
+anyhow = "1.0"
+
+# Examples need a real windowed app; that platform stack lives here so the lib
+# proper stays lean.
+[dev-dependencies]
+bevy = { version = "0.19" }
+serde_json = "1.0"

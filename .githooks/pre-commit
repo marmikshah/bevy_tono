@@ -1,0 +1,5 @@
+#!/bin/sh
+# Canonical pre-commit hook: the same gate, locally and fast.
+# Installed by the workspace `make` bootstrap (git config core.hooksPath .githooks).
+# Bypass in an emergency with --no-verify.
+exec make pre-commit-checks
