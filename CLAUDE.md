@@ -47,10 +47,11 @@ and played by handle.
 
 ## Dependency on tono-core
 
-`tono-core` is a **path dependency** (`../../sonarium/crates/tono-core`) for
-fast local iteration — edit a sound, rebuild the game, hear it. To publish
-bevy_tono to crates.io the dep must become a versioned crates.io dependency
-(`tono-core = "x.y"`); crates.io rejects path/git deps.
+`tono-core` is a **crates.io dependency** (`tono-core = "1.3"`), so the crate is
+standalone — it clones, builds, publishes, and CI-tests without the `tono`
+workspace checked out beside it. To hack on the engine and the plugin together
+locally, add a `[patch.crates-io]` override pointing `tono-core` at a local
+checkout — no source change needed.
 
 ## Dev notes
 
