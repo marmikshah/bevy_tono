@@ -60,6 +60,7 @@ Run the demo: `cargo run --example play`.
 | `music_layer(&doc, fade_in_at)` | add an intensity-gated music stem |
 | `set_intensity(0..1)` | cross-fade the music bed with the action |
 | `stinger(&doc)` | fire a one-shot over the music |
+| `set_master_gain(0..1)` | global volume — scales the whole bus (SFX + music) |
 
 Audio runs on a dedicated thread that owns the `cpal` stream; the callback only
 `try_lock`s, so a game-thread poke never blocks or clicks the output. With no

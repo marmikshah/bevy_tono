@@ -116,6 +116,13 @@ impl TonoAudio {
         lock(&self.bus).music.stinger(&d);
     }
 
+    /// Set the master output gain applied to the whole bus (SFX + music),
+    /// `0.0..=1.0` — a global volume knob. Clamped; applied per sample, so a
+    /// change is click-free at the buffer scale.
+    pub fn set_master_gain(&self, gain: f32) {
+        lock(&self.bus).master_gain = gain.clamp(0.0, 1.0);
+    }
+
     /// The device sample rate the engine renders at.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
@@ -138,6 +145,7 @@ struct GameBus {
     engine: Engine,
     music: AdaptiveMusic,
     scratch: Vec<f32>,
+    master_gain: f32,
 }
 
 impl GameBus {
@@ -146,6 +154,7 @@ impl GameBus {
             engine: Engine::new(sample_rate),
             music: AdaptiveMusic::new(sample_rate),
             scratch: Vec::new(),
+            master_gain: 1.0,
         }
     }
 }
@@ -158,8 +167,9 @@ impl AudioSource for GameBus {
         }
         let music = &mut self.scratch[..out.len()];
         self.music.fill(music);
+        let g = self.master_gain;
         for (o, &m) in out.iter_mut().zip(music.iter()) {
-            *o = (*o + m).clamp(-1.0, 1.0);
+            *o = ((*o + m) * g).clamp(-1.0, 1.0);
         }
         n
     }
@@ -289,5 +299,17 @@ mod tests {
         let mut out = vec![0.0f32; 512 * 2];
         bus.fill(&mut out);
         assert!(out.iter().any(|&x| x != 0.0), "music bed sounds");
+    }
+
+    #[test]
+    fn master_gain_scales_and_silences() {
+        let mut bus = GameBus::new(48_000);
+        let patch = bus.engine.load(&blip());
+        bus.engine.play(patch);
+        bus.master_gain = 0.0;
+        let mut out = vec![0.0f32; 512 * 2];
+        bus.fill(&mut out);
+        let peak = out.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        assert_eq!(peak, 0.0, "master gain 0 mutes the bus");
     }
 }
