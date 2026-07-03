@@ -27,10 +27,13 @@ and played by handle.
 ## Architecture
 
 - `src/lib.rs` — the whole surface:
-  - `TonoPlugin` — spawns the audio thread, inserts `TonoAudio`.
+  - `TonoPlugin` — spawns the audio thread, inserts `TonoAudio`, registers the
+    `PlaySfx` message + its draining system.
   - `TonoAudio` (a Bevy `Resource`) — `register`/`play`/`play_looping`/`stop`/
-    `set_gain` for SFX, `music_layer`/`set_intensity`/`stinger` for the bed,
-    and `set_master_gain` for global volume.
+    `set_gain` for SFX, `music_layer`/`set_intensity`/`stinger`/`play_song` for
+    the bed, and `set_master_gain` for global volume.
+  - `PlaySfx` (a `Message`) — fire a `Sound` from a system without the resource;
+    `play_queued_sfx` drains the queue each `Update`.
   - `Sound` (a registered `PatchId`) and `Voice` (a live `InstanceHandle`).
   - `GameBus` — an `AudioSource` summing the SFX `Engine` and the
     `AdaptiveMusic` bed to stereo.
