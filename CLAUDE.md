@@ -28,13 +28,16 @@ and played by handle.
 
 - `src/lib.rs` — the whole surface:
   - `TonoPlugin` — spawns the audio thread, inserts `TonoAudio`, registers the
-    `PlaySfx` message + its draining system.
+    `PlaySfx`/`PlayNote`/`StopNote` messages + their draining systems.
   - `TonoAudio` (a Bevy `Resource`) — `register`/`play`/`play_looping`/`stop`/
     `set_gain` for SFX, `music_layer`/`set_intensity`/`stinger`/`play_song` for
-    the bed, and `set_master_gain` for global volume.
-  - `PlaySfx` (a `Message`) — fire a `Sound` from a system without the resource;
-    `play_queued_sfx` drains the queue each `Update`.
-  - `Sound` (a registered `PatchId`) and `Voice` (a live `InstanceHandle`).
+    the bed, `preset`/`add_instrument`/`note_on`/`note_off`/`set_bend` for live
+    instruments, and `set_master_gain` for global volume.
+  - `PlaySfx` / `PlayNote` / `StopNote` (`Message`s) — make sound from a system
+    without the resource; `play_queued_sfx` / `drain_notes` drain each `Update`.
+  - `Sound` (a `PatchId`), `Voice` (an `InstanceHandle`), `InstrumentId` (an
+    index into the bus's live `Instrument`s). `GameBus` mixes engine + music +
+    instruments.
   - `GameBus` — an `AudioSource` summing the SFX `Engine` and the
     `AdaptiveMusic` bed to stereo.
   - `spawn_audio`/`build_stream`/`fill_output` — the dedicated `cpal` thread.

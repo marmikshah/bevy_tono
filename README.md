@@ -62,17 +62,24 @@ Run the demo: `cargo run --example play`.
 | `stinger(&doc)` | fire a one-shot over the music |
 | `set_master_gain(0..1)` | global volume — scales the whole bus (SFX + music) |
 | `play_song(&Song)` | compile a catalog [`Song`] and bed it as looping music |
+| `preset(name) -> InstrumentId` | register a live, playable instrument from a factory preset |
+| `note_on(inst, note, vel)` / `note_off(inst, note)` / `set_bend(inst, semis)` | play it note-by-note |
 
-Or fire sounds by **message** — a system that never touches the audio resource:
+Or make sound by **message** — a system that never touches the audio resource:
 
 ```rust
 fn shoot(mut sfx: MessageWriter<PlaySfx>, laser: Res<Laser>) {
     sfx.write(PlaySfx::new(laser.0).with_gain(0.8));
 }
+
+fn play_note(mut on: MessageWriter<PlayNote>, synth: Res<Synth>) {
+    on.write(PlayNote::new(synth.0, Note::C4).with_velocity(0.9)); // + StopNote to release
+}
 ```
 
-`TonoPlugin` registers `PlaySfx` and drains it each frame. Author a whole song
-with the catalog + `Song` builder and hand it to `play_song`.
+`TonoPlugin` registers `PlaySfx` / `PlayNote` / `StopNote` and drains them each
+frame. Author a whole song with the catalog + `Song` builder and hand it to
+`play_song`, or play an instrument live — see `cargo run --example keys`.
 
 Audio runs on a dedicated thread that owns the `cpal` stream; the callback only
 `try_lock`s, so a game-thread poke never blocks or clicks the output. With no
