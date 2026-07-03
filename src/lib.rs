@@ -34,12 +34,15 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use tono_core::adaptive::{AdaptiveMusic, LoopBuffer};
 use tono_core::dsl::SoundDoc;
+use tono_core::instrument::{Instrument, InstrumentDesign};
 use tono_core::runtime::{AudioSource, Engine, InstanceHandle, PatchId, Tween};
 
 /// The engine, re-exported so a downstream game needs only `bevy_tono` as a
 /// dependency — author sounds with [`tono_core::dsl::SoundDoc`] without wiring
 /// up a second crate.
 pub use tono_core;
+/// A pitch for the live instrument layer, re-exported for convenience.
+pub use tono_core::instrument::Note;
 
 /// A registered sound — a `SoundDoc` loaded into the engine, ready to play.
 #[derive(Clone, Copy, Debug)]
@@ -48,6 +51,11 @@ pub struct Sound(PatchId);
 /// A sounding voice — one playing instance of a [`Sound`].
 #[derive(Clone, Copy, Debug)]
 pub struct Voice(InstanceHandle);
+
+/// A live, polyphonic instrument you can play note-by-note (from a preset or an
+/// [`InstrumentDesign`]). Register one, then `note_on`/`note_off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InstrumentId(usize);
 
 /// The Bevy resource: play SFX and drive adaptive music from your systems.
 #[derive(Resource, Clone)]
@@ -124,6 +132,46 @@ impl TonoAudio {
         Ok(())
     }
 
+    /// Register a live, playable [`Instrument`] from a factory preset (see
+    /// `tono_core::presets` for names, e.g. `"vibrato_lead"`, `"sub_bass"`,
+    /// `"fm_tine"`). Errs on an unknown name.
+    pub fn preset(&self, name: &str) -> Result<InstrumentId, String> {
+        let design =
+            tono_core::presets::preset(name).ok_or_else(|| format!("unknown preset '{name}'"))?;
+        self.add_instrument(design)
+    }
+
+    /// Register a live, playable instrument from an [`InstrumentDesign`].
+    pub fn add_instrument(&self, design: InstrumentDesign) -> Result<InstrumentId, String> {
+        let inst = Instrument::new(design, self.sample_rate).map_err(|e| format!("{e:?}"))?;
+        let mut bus = lock(&self.bus);
+        bus.instruments.push(inst);
+        Ok(InstrumentId(bus.instruments.len() - 1))
+    }
+
+    /// Start a note on a registered instrument (velocity 0..1). Polyphonic —
+    /// hold several at once.
+    pub fn note_on(&self, instrument: InstrumentId, note: Note, velocity: f32) {
+        if let Some(inst) = lock(&self.bus).instruments.get_mut(instrument.0) {
+            inst.note_on(note, velocity);
+        }
+    }
+
+    /// Release a note on a registered instrument.
+    pub fn note_off(&self, instrument: InstrumentId, note: Note) {
+        if let Some(inst) = lock(&self.bus).instruments.get_mut(instrument.0) {
+            inst.note_off(note);
+        }
+    }
+
+    /// Set the pitch bend, in semitones, on a registered instrument (a whammy /
+    /// bend-wheel knob; applies to its sounding voices).
+    pub fn set_bend(&self, instrument: InstrumentId, semitones: f32) {
+        if let Some(inst) = lock(&self.bus).instruments.get_mut(instrument.0) {
+            inst.set_bend(semitones);
+        }
+    }
+
     /// Set the master output gain applied to the whole bus (SFX + music),
     /// `0.0..=1.0` — a global volume knob. Clamped; applied per sample, so a
     /// change is click-free at the buffer scale.
@@ -162,6 +210,44 @@ impl PlaySfx {
     }
 }
 
+/// Start a note on a registered live instrument — the ECS-friendly way to play
+/// an instrument note-by-note. Write it with a `MessageWriter<PlayNote>`.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct PlayNote {
+    /// The registered instrument to play.
+    pub instrument: InstrumentId,
+    /// The pitch.
+    pub note: Note,
+    /// Velocity, 0..1.
+    pub velocity: f32,
+}
+
+impl PlayNote {
+    /// Play `note` on `instrument` at a default velocity.
+    pub fn new(instrument: InstrumentId, note: Note) -> Self {
+        PlayNote {
+            instrument,
+            note,
+            velocity: 0.9,
+        }
+    }
+
+    /// Set the velocity (0..1).
+    pub fn with_velocity(mut self, velocity: f32) -> Self {
+        self.velocity = velocity;
+        self
+    }
+}
+
+/// Release a note on a registered live instrument (pair with [`PlayNote`]).
+#[derive(Message, Clone, Copy, Debug)]
+pub struct StopNote {
+    /// The registered instrument.
+    pub instrument: InstrumentId,
+    /// The pitch to release.
+    pub note: Note,
+}
+
 /// Drain queued [`PlaySfx`] messages and fire them on the audio bus.
 fn play_queued_sfx(mut sfx: MessageReader<PlaySfx>, audio: Res<TonoAudio>) {
     for e in sfx.read() {
@@ -172,8 +258,23 @@ fn play_queued_sfx(mut sfx: MessageReader<PlaySfx>, audio: Res<TonoAudio>) {
     }
 }
 
+/// Drain queued [`PlayNote`]/[`StopNote`] messages onto the live instruments.
+fn drain_notes(
+    mut on: MessageReader<PlayNote>,
+    mut off: MessageReader<StopNote>,
+    audio: Res<TonoAudio>,
+) {
+    for e in on.read() {
+        audio.note_on(e.instrument, e.note, e.velocity);
+    }
+    for e in off.read() {
+        audio.note_off(e.instrument, e.note);
+    }
+}
+
 /// The plugin: sets up real-time audio, inserts [`TonoAudio`], and wires the
-/// [`PlaySfx`] message so systems can fire sounds without touching the resource.
+/// [`PlaySfx`] / [`PlayNote`] / [`StopNote`] messages so systems can make sound
+/// without touching the resource.
 pub struct TonoPlugin;
 
 impl Plugin for TonoPlugin {
@@ -181,15 +282,18 @@ impl Plugin for TonoPlugin {
         let (bus, sample_rate) = spawn_audio();
         app.insert_resource(TonoAudio { bus, sample_rate })
             .add_message::<PlaySfx>()
-            .add_systems(Update, play_queued_sfx);
+            .add_message::<PlayNote>()
+            .add_message::<StopNote>()
+            .add_systems(Update, (play_queued_sfx, drain_notes));
     }
 }
 
-/// The mixed audio bus: the SFX/one-shot [`Engine`] plus an [`AdaptiveMusic`]
-/// bed, summed to stereo.
+/// The mixed audio bus: the SFX/one-shot [`Engine`], an [`AdaptiveMusic`] bed,
+/// and the live [`Instrument`]s, summed to stereo.
 struct GameBus {
     engine: Engine,
     music: AdaptiveMusic,
+    instruments: Vec<Instrument>,
     scratch: Vec<f32>,
     master_gain: f32,
 }
@@ -199,6 +303,7 @@ impl GameBus {
         GameBus {
             engine: Engine::new(sample_rate),
             music: AdaptiveMusic::new(sample_rate),
+            instruments: Vec::new(),
             scratch: Vec::new(),
             master_gain: 1.0,
         }
@@ -208,14 +313,25 @@ impl GameBus {
 impl AudioSource for GameBus {
     fn fill(&mut self, out: &mut [f32]) -> usize {
         let n = self.engine.fill(out); // SFX / one-shots (writes the whole buffer)
-        if self.scratch.len() < out.len() {
-            self.scratch.resize(out.len(), 0.0);
+        let len = out.len();
+        if self.scratch.len() < len {
+            self.scratch.resize(len, 0.0);
         }
-        let music = &mut self.scratch[..out.len()];
-        self.music.fill(music);
+        // Add the music bed, then each live instrument, through the scratch.
+        self.music.fill(&mut self.scratch[..len]);
+        for (o, &s) in out.iter_mut().zip(self.scratch[..len].iter()) {
+            *o += s;
+        }
+        for inst in &mut self.instruments {
+            inst.fill(&mut self.scratch[..len]);
+            for (o, &s) in out.iter_mut().zip(self.scratch[..len].iter()) {
+                *o += s;
+            }
+        }
+        // Master gain + clamp.
         let g = self.master_gain;
-        for (o, &m) in out.iter_mut().zip(music.iter()) {
-            *o = ((*o + m) * g).clamp(-1.0, 1.0);
+        for o in out.iter_mut() {
+            *o = (*o * g).clamp(-1.0, 1.0);
         }
         n
     }
@@ -395,5 +511,34 @@ mod tests {
             app.world().resource::<TonoAudio>().play_song(&song).is_ok(),
             "the song compiles and beds"
         );
+    }
+
+    #[test]
+    fn live_instrument_plays_a_held_note() {
+        use bevy::MinimalPlugins;
+        use bevy::app::App;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins).add_plugins(TonoPlugin);
+
+        // Register a preset instrument and play a note by message.
+        let inst = app
+            .world()
+            .resource::<TonoAudio>()
+            .preset("vibrato_lead")
+            .expect("the preset exists");
+        app.world_mut()
+            .write_message(PlayNote::new(inst, Note::C4).with_velocity(0.9));
+        app.update(); // drain_notes fires note_on
+
+        // A held note sustains — pull a few buffers and confirm it sounds.
+        let bus = app.world().resource::<TonoAudio>().bus.clone();
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            let mut out = vec![0.0f32; 512 * 2];
+            lock(&bus).fill(&mut out);
+            peak = peak.max(out.iter().fold(0.0f32, |m, &x| m.max(x.abs())));
+        }
+        assert!(peak > 0.0, "the held instrument note sounds");
     }
 }
