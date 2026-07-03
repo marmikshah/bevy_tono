@@ -2,12 +2,13 @@
 //!
 //!     cargo run --example play
 //!
-//! Shows the whole surface — register a sound once, `play` it on input, and
-//! drive an adaptive music bed with `set_intensity`.
+//! Shows the whole surface — register a sound once, fire it on input with a
+//! `PlaySfx` message (no audio resource needed in the game system), and drive an
+//! adaptive music bed with `set_intensity`.
 
 use bevy::prelude::*;
 use bevy_tono::tono_core::dsl::SoundDoc;
-use bevy_tono::{Sound, TonoAudio, TonoPlugin};
+use bevy_tono::{PlaySfx, Sound, TonoAudio, TonoPlugin};
 
 #[derive(Resource)]
 struct Blip(Sound);
@@ -56,9 +57,14 @@ fn setup(mut commands: Commands, audio: Res<TonoAudio>) {
     println!("bevy_tono example — press SPACE to blip; the music breathes on its own.");
 }
 
-fn play_on_space(keys: Res<ButtonInput<KeyCode>>, audio: Res<TonoAudio>, blip: Res<Blip>) {
+fn play_on_space(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut sfx: MessageWriter<PlaySfx>,
+    blip: Res<Blip>,
+) {
     if keys.just_pressed(KeyCode::Space) {
-        audio.play(blip.0);
+        // Fire the sound by message — this system never touches the audio bus.
+        sfx.write(PlaySfx::new(blip.0));
     }
 }
 

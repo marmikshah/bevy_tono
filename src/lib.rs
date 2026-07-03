@@ -116,6 +116,14 @@ impl TonoAudio {
         lock(&self.bus).music.stinger(&d);
     }
 
+    /// Compile a [`Song`](tono_core::song::Song) and play it as an always-on
+    /// looping music bed. Returns the compile error if the song is invalid.
+    pub fn play_song(&self, song: &tono_core::song::Song) -> Result<(), String> {
+        let doc = song.to_doc()?;
+        self.music_layer(&doc, 0.0);
+        Ok(())
+    }
+
     /// Set the master output gain applied to the whole bus (SFX + music),
     /// `0.0..=1.0` — a global volume knob. Clamped; applied per sample, so a
     /// change is click-free at the buffer scale.
@@ -129,13 +137,51 @@ impl TonoAudio {
     }
 }
 
-/// The plugin: sets up real-time audio and inserts [`TonoAudio`].
+/// Fire a one-shot [`Sound`] by writing this message — the ECS-friendly
+/// alternative to reaching for [`TonoAudio`] in a system. A game system takes a
+/// `MessageWriter<PlaySfx>` and writes `PlaySfx::new(sound)`; [`TonoPlugin`]
+/// drains the queue each frame and plays them.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct PlaySfx {
+    /// The registered sound to play.
+    pub sound: Sound,
+    /// Playback gain (1.0 = unity).
+    pub gain: f32,
+}
+
+impl PlaySfx {
+    /// Play `sound` at unity gain.
+    pub fn new(sound: Sound) -> Self {
+        PlaySfx { sound, gain: 1.0 }
+    }
+
+    /// Set the gain (0..).
+    pub fn with_gain(mut self, gain: f32) -> Self {
+        self.gain = gain;
+        self
+    }
+}
+
+/// Drain queued [`PlaySfx`] messages and fire them on the audio bus.
+fn play_queued_sfx(mut sfx: MessageReader<PlaySfx>, audio: Res<TonoAudio>) {
+    for e in sfx.read() {
+        let voice = audio.play(e.sound);
+        if e.gain != 1.0 {
+            audio.set_gain(voice, e.gain);
+        }
+    }
+}
+
+/// The plugin: sets up real-time audio, inserts [`TonoAudio`], and wires the
+/// [`PlaySfx`] message so systems can fire sounds without touching the resource.
 pub struct TonoPlugin;
 
 impl Plugin for TonoPlugin {
     fn build(&self, app: &mut App) {
         let (bus, sample_rate) = spawn_audio();
-        app.insert_resource(TonoAudio { bus, sample_rate });
+        app.insert_resource(TonoAudio { bus, sample_rate })
+            .add_message::<PlaySfx>()
+            .add_systems(Update, play_queued_sfx);
     }
 }
 
@@ -311,5 +357,43 @@ mod tests {
         bus.fill(&mut out);
         let peak = out.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
         assert_eq!(peak, 0.0, "master gain 0 mutes the bus");
+    }
+
+    #[test]
+    fn ecs_layer_plays_sfx_and_beds_a_song() {
+        use bevy::MinimalPlugins;
+        use bevy::app::App;
+        use tono_core::dsl::{Adsr, SeqWave};
+        use tono_core::song::{Song, note};
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins).add_plugins(TonoPlugin);
+
+        // PlaySfx: a registered sound fired via the message queue is drained and
+        // played by the plugin's system on update — without panicking.
+        let sound = app.world().resource::<TonoAudio>().register(&blip());
+        app.world_mut()
+            .write_message(PlaySfx::new(sound).with_gain(0.7));
+        app.update();
+
+        // play_song: a Song compiles and beds as a looping music layer.
+        let mut song = Song::new("bg", 100.0);
+        song.add_track(
+            "bass",
+            SeqWave::Bass,
+            Adsr {
+                a: 0.005,
+                d: 0.1,
+                s: 0.9,
+                r: 0.1,
+                punch: 0.0,
+            },
+        );
+        song.add_pattern("r", 1, vec![note(0, 4, "C2"), note(8, 4, "G2")]);
+        song.arrange("bass", "r", 0);
+        assert!(
+            app.world().resource::<TonoAudio>().play_song(&song).is_ok(),
+            "the song compiles and beds"
+        );
     }
 }
