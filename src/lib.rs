@@ -44,6 +44,75 @@ pub use tono_core;
 /// A pitch for the live instrument layer, re-exported for convenience.
 pub use tono_core::instrument::Note;
 
+/// Offline, build-time audio audit — render each [`SoundDoc`] and grade it
+/// against tono's review targets, with no audio device.
+///
+/// tono-core has a full review layer (archetype targets, PASS/WARN/FAIL
+/// findings, LUFS / true-peak analysis) but it is only reachable through the CLI
+/// or `tono_core::review` directly, so a game wiring an `audio` build target had
+/// to hand-roll the render → analyse → review glue. This surfaces it: a Makefile
+/// `audio` target renders every registered doc, grades it, and fails on a
+/// `FAIL`.
+///
+/// ```no_run
+/// use bevy_tono::review::{self, AuditItem, Archetype};
+/// use bevy_tono::tono_core::dsl::SoundDoc;
+///
+/// # fn docs() -> Vec<(String, SoundDoc)> { Vec::new() }
+/// let owned = docs();
+/// let items: Vec<AuditItem> = owned
+///     .iter()
+///     .map(|(name, doc)| AuditItem { name, doc, archetype: Some(Archetype::Ui) })
+///     .collect();
+/// let reviews = review::audit(&items);
+/// if review::any_failed(&reviews) {
+///     std::process::exit(1); // fail the build target
+/// }
+/// ```
+pub mod review {
+    use tono_core::dsl::{Playback, SoundDoc};
+    use tono_core::{analysis, render};
+
+    /// The review types, re-exported so the audit reads with one dependency.
+    pub use tono_core::review::{Archetype, Finding, Review, Status};
+
+    /// Render `doc` offline and grade it. `archetype` selects the target table
+    /// (`None` runs only the universal ship checklist — clipping, silence, loop
+    /// seam, onset count). Deterministic and device-free: safe in a build script
+    /// or a test. Renders at the doc's own `sample_rate`.
+    pub fn grade(doc: &SoundDoc, archetype: Option<Archetype>) -> Review {
+        let samples = render::render(doc);
+        let a = analysis::stats(&samples, doc.sample_rate);
+        // The seam check only applies to looping docs; pass it only then.
+        let seam =
+            matches!(doc.playback, Playback::Loop { .. }).then(|| render::loop_seam_db(&samples));
+        tono_core::review::review(doc, &a, archetype, seam)
+    }
+
+    /// A doc to audit: a name for reporting plus the archetype to grade against.
+    pub struct AuditItem<'a> {
+        /// Reporting label (e.g. the doc's file stem).
+        pub name: &'a str,
+        /// The document to render and grade.
+        pub doc: &'a SoundDoc,
+        /// The archetype target, or `None` for the universal checklist only.
+        pub archetype: Option<Archetype>,
+    }
+
+    /// Grade a whole set of docs, returning each name with its [`Review`].
+    pub fn audit(items: &[AuditItem<'_>]) -> Vec<(String, Review)> {
+        items
+            .iter()
+            .map(|it| (it.name.to_string(), grade(it.doc, it.archetype)))
+            .collect()
+    }
+
+    /// Did any doc grade `FAIL`? The predicate a build target gates on.
+    pub fn any_failed(reviews: &[(String, Review)]) -> bool {
+        reviews.iter().any(|(_, r)| r.grade == Status::Fail)
+    }
+}
+
 /// A registered sound — a `SoundDoc` loaded into the engine, ready to play.
 #[derive(Clone, Copy, Debug)]
 pub struct Sound(PatchId);
@@ -540,5 +609,37 @@ mod tests {
             peak = peak.max(out.iter().fold(0.0f32, |m, &x| m.max(x.abs())));
         }
         assert!(peak > 0.0, "the held instrument note sounds");
+    }
+
+    #[test]
+    fn review_grades_a_rendered_doc_offline() {
+        use crate::review::{self, Archetype, AuditItem, Status};
+
+        let mut doc = blip();
+        doc.sample_rate = 48_000;
+
+        // A single doc renders + grades (no device) to a Review with findings
+        // and one of the three overall grades.
+        let r = review::grade(&doc, Some(Archetype::Ui));
+        assert!(!r.findings.is_empty(), "the review produced findings");
+        assert!(matches!(
+            r.grade,
+            Status::Pass | Status::Warn | Status::Fail
+        ));
+
+        // The batch API pairs each name with its review; the gate predicate
+        // reflects the worst grade in the set.
+        let items = [AuditItem {
+            name: "blip",
+            doc: &doc,
+            archetype: Some(Archetype::Ui),
+        }];
+        let reviews = review::audit(&items);
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].0, "blip");
+        assert_eq!(
+            review::any_failed(&reviews),
+            reviews[0].1.grade == Status::Fail
+        );
     }
 }
