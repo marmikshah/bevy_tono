@@ -1,7 +1,18 @@
 #!/bin/sh
-# Canonical pre-push hook: mirrors CI (checks + tests).
-# Installed by the workspace `make` bootstrap (git config core.hooksPath .githooks).
+# Canonical pre-push hook: refuse direct master pushes, then mirror CI.
+# Installed by `make hooks` (git config core.hooksPath .githooks).
 # Bypass in an emergency with --no-verify.
 set -e
+
+# Nobody pushes master directly — trunk is PR + squash/rebase only.
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+	case "$remote_ref" in
+	refs/heads/master)
+		echo "pre-push: refusing a direct push to master — open a PR instead." >&2
+		exit 1
+		;;
+	esac
+done
+
 make pre-commit-checks
 make test
