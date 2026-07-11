@@ -91,5 +91,4 @@ for the vocabulary.
 
 ## License
 
-Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE),
-at your option.
+Released under the [MIT License](LICENSE).
