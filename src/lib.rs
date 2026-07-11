@@ -84,6 +84,16 @@ pub mod review {
     /// seam, onset count). Deterministic and device-free: safe in a build script
     /// or a test. Renders at the doc's own `sample_rate`.
     pub fn grade(doc: &SoundDoc, archetype: Option<Archetype>) -> Review {
+        // A zero/unset sample rate would make `analysis::stats` divide by the
+        // rate → NaN/garbage. Grade at a sane rate rather than trust the field.
+        let doc = if doc.sample_rate == 0 {
+            let mut d = doc.clone();
+            d.sample_rate = 48_000;
+            std::borrow::Cow::Owned(d)
+        } else {
+            std::borrow::Cow::Borrowed(doc)
+        };
+        let doc = doc.as_ref();
         let samples = render::render(doc);
         let a = analysis::stats(&samples, doc.sample_rate);
         // The seam check only applies to looping docs; pass it only then.
@@ -324,23 +334,32 @@ impl TonoAudio {
     /// Start a note on a registered instrument (velocity 0..1). Polyphonic —
     /// hold several at once.
     pub fn note_on(&self, instrument: InstrumentId, note: Note, velocity: f32) {
-        if let Some(inst) = lock(&self.bus).instruments.get_mut(instrument.0) {
+        let mut bus = lock(&self.bus);
+        if let Some(inst) = bus.instruments.get_mut(instrument.0) {
             inst.note_on(note, velocity);
+        } else {
+            debug_assert!(false, "note_on: unknown instrument {}", instrument.0);
         }
     }
 
     /// Release a note on a registered instrument.
     pub fn note_off(&self, instrument: InstrumentId, note: Note) {
-        if let Some(inst) = lock(&self.bus).instruments.get_mut(instrument.0) {
+        let mut bus = lock(&self.bus);
+        if let Some(inst) = bus.instruments.get_mut(instrument.0) {
             inst.note_off(note);
+        } else {
+            debug_assert!(false, "note_off: unknown instrument {}", instrument.0);
         }
     }
 
     /// Set the pitch bend, in semitones, on a registered instrument (a whammy /
     /// bend-wheel knob; applies to its sounding voices).
     pub fn set_bend(&self, instrument: InstrumentId, semitones: f32) {
-        if let Some(inst) = lock(&self.bus).instruments.get_mut(instrument.0) {
+        let mut bus = lock(&self.bus);
+        if let Some(inst) = bus.instruments.get_mut(instrument.0) {
             inst.set_bend(semitones);
+        } else {
+            debug_assert!(false, "set_bend: unknown instrument {}", instrument.0);
         }
     }
 
