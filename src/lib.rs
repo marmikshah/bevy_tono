@@ -41,6 +41,9 @@ use tono_core::runtime::{AudioSource, Engine, InstanceHandle, PatchId, Tween};
 /// dependency — author sounds with [`tono_core::dsl::SoundDoc`] without wiring
 /// up a second crate.
 pub use tono_core;
+/// Beat/bar quantization for scheduled music changes (intensity, stingers,
+/// section swaps), re-exported for convenience.
+pub use tono_core::adaptive::Quantize;
 /// A pitch for the live instrument layer, re-exported for convenience.
 pub use tono_core::instrument::Note;
 
@@ -199,6 +202,106 @@ impl TonoAudio {
         let doc = song.to_doc()?;
         self.music_layer(&doc, 0.0);
         Ok(())
+    }
+
+    // ---- Transport (beat-locked playback) ----
+
+    /// Pause the music bed — output goes silent while the position clock and
+    /// every layer hold, so [`music_resume`](Self::music_resume) continues
+    /// seamlessly.
+    pub fn music_pause(&self) {
+        lock(&self.bus).music.pause();
+    }
+
+    /// Resume the music bed from a [`music_pause`](Self::music_pause).
+    pub fn music_resume(&self) {
+        lock(&self.bus).music.resume();
+    }
+
+    /// Whether the music bed is currently paused.
+    pub fn music_is_paused(&self) -> bool {
+        lock(&self.bus).music.is_paused()
+    }
+
+    /// Restart the bed from sample 0 — the position clock and every layer rewind
+    /// to their loop head. Call this to line the music up with a beat clock.
+    pub fn music_reset(&self) {
+        lock(&self.bus).music.reset();
+    }
+
+    /// Frames of music rendered while playing since start or the last
+    /// [`music_reset`](Self::music_reset) — the sample-exact musical clock a
+    /// beat-locked game derives its beat position from. Holds while paused.
+    pub fn music_position_frames(&self) -> u64 {
+        lock(&self.bus).music.position_frames()
+    }
+
+    /// Duck the whole bed to `1.0 - depth`, recovering over `release` — a fast
+    /// sidechain for stingers or SFX, independent of the (slower) intensity
+    /// cross-fade.
+    pub fn music_duck(&self, depth: f32, release: std::time::Duration) {
+        lock(&self.bus).music.duck(depth, release);
+    }
+
+    // ---- Musical time & quantized scheduling ----
+
+    /// Set the tempo so intensity changes, stingers and section swaps can align
+    /// to beats/bars. Required for any [`Quantize`] other than
+    /// [`Immediate`](Quantize::Immediate).
+    pub fn set_music_tempo(&self, bpm: f32, beats_per_bar: u32) {
+        lock(&self.bus).music.set_tempo(bpm, beats_per_bar);
+    }
+
+    /// The musical position in beats since the last [`music_reset`](Self::music_reset).
+    pub fn music_beats(&self) -> f64 {
+        lock(&self.bus).music.beats()
+    }
+
+    /// The musical position in bars since the last [`music_reset`](Self::music_reset).
+    pub fn music_bars(&self) -> f64 {
+        lock(&self.bus).music.bars()
+    }
+
+    /// Set the intensity on a beat/bar boundary — the quantized counterpart of
+    /// [`set_intensity`](Self::set_intensity).
+    pub fn set_intensity_at(&self, intensity: f32, quantize: Quantize) {
+        lock(&self.bus).music.set_intensity_at(intensity, quantize);
+    }
+
+    /// Fire a stinger on a beat/bar boundary. The stinger is rendered now; only
+    /// its playback is deferred to the boundary.
+    pub fn stinger_at(&self, doc: &SoundDoc, quantize: Quantize) {
+        let mut d = doc.clone();
+        d.sample_rate = self.sample_rate;
+        lock(&self.bus).music.stinger_at(&d, quantize);
+    }
+
+    // ---- Horizontal sections ----
+
+    /// Add a horizontal section (a looping bed) and return its index. The first
+    /// section added starts playing; switch between them with
+    /// [`transition_to_section`](Self::transition_to_section).
+    pub fn add_section(&self, name: impl Into<String>, doc: &SoundDoc) -> usize {
+        let mut d = doc.clone();
+        d.sample_rate = self.sample_rate;
+        lock(&self.bus).music.add_section(name, &d)
+    }
+
+    /// Cross-fade to another section on a beat/bar boundary — horizontal
+    /// re-sequencing (swap "explore" for "battle" on the next bar, no mid-phrase
+    /// cut).
+    pub fn transition_to_section(&self, section: usize, quantize: Quantize) {
+        lock(&self.bus).music.transition_to(section, quantize);
+    }
+
+    /// The section currently sounding, if any.
+    pub fn current_section(&self) -> Option<usize> {
+        lock(&self.bus).music.current_section()
+    }
+
+    /// Look up a section index by name.
+    pub fn section_named(&self, name: &str) -> Option<usize> {
+        lock(&self.bus).music.section_named(name)
     }
 
     /// Register a live, playable [`Instrument`] from a factory preset (see
@@ -641,5 +744,66 @@ mod tests {
             review::any_failed(&reviews),
             reviews[0].1.grade == Status::Fail
         );
+    }
+
+    fn audio_app() -> (App, TonoAudio) {
+        use bevy::MinimalPlugins;
+        use bevy::app::App;
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins).add_plugins(TonoPlugin);
+        let audio = app.world().resource::<TonoAudio>().clone();
+        (app, audio)
+    }
+
+    #[test]
+    fn transport_position_pause_and_reset() {
+        let (app, audio) = audio_app();
+        audio.music_layer(&blip(), 0.0); // an always-on stem so the clock advances
+
+        assert_eq!(audio.music_position_frames(), 0);
+        assert!(!audio.music_is_paused());
+
+        // No audio device in tests — advance the bed by filling the bus directly.
+        let bus = app.world().resource::<TonoAudio>().bus.clone();
+        lock(&bus).fill(&mut vec![0.0f32; 256 * 2]);
+        assert_eq!(audio.music_position_frames(), 256, "the clock advances");
+
+        audio.music_pause();
+        assert!(audio.music_is_paused());
+        lock(&bus).fill(&mut vec![0.0f32; 256 * 2]);
+        assert_eq!(
+            audio.music_position_frames(),
+            256,
+            "the clock holds while paused"
+        );
+
+        audio.music_resume();
+        audio.music_reset();
+        assert_eq!(audio.music_position_frames(), 0, "reset zeroes the clock");
+        // Transport-only calls stay callable without a device.
+        audio.music_duck(0.5, std::time::Duration::from_millis(180));
+    }
+
+    #[test]
+    fn tempo_beats_and_sections() {
+        let (_app, audio) = audio_app();
+
+        audio.set_music_tempo(120.0, 4);
+        assert_eq!(audio.music_beats(), 0.0);
+        assert_eq!(audio.music_bars(), 0.0);
+
+        // Sections: first added plays; lookups resolve by name and index.
+        let explore = audio.add_section("explore", &blip());
+        let battle = audio.add_section("battle", &blip());
+        assert_eq!((explore, battle), (0, 1));
+        assert_eq!(audio.current_section(), Some(0), "the first section plays");
+        assert_eq!(audio.section_named("battle"), Some(1));
+        assert_eq!(audio.section_named("nope"), None);
+
+        // Quantized scheduling is callable and doesn't panic (the scheduling
+        // logic itself is covered in tono-core).
+        audio.transition_to_section(battle, Quantize::Bar);
+        audio.set_intensity_at(1.0, Quantize::Beat);
+        audio.stinger_at(&blip(), Quantize::Beat);
     }
 }
