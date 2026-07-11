@@ -165,6 +165,17 @@ impl TonoAudio {
         Voice(lock(&self.bus).engine.play(sound.0))
     }
 
+    /// Fire a one-shot that starts at `gain` (no 20 ms ramp from unity, so a
+    /// short/transient SFX honours the level from its very first sample).
+    pub fn play_with_gain(&self, sound: Sound, gain: f32) -> Voice {
+        let mut bus = lock(&self.bus);
+        let h = bus.engine.play(sound.0);
+        if gain != 1.0 {
+            bus.engine.set_gain(h, gain, Tween::IMMEDIATE);
+        }
+        Voice(h)
+    }
+
     /// Start a looping voice (e.g. an ambience bed).
     pub fn play_looping(&self, sound: Sound) -> Voice {
         Voice(lock(&self.bus).engine.play_looping(sound.0))
@@ -203,7 +214,11 @@ impl TonoAudio {
     pub fn stinger(&self, doc: &SoundDoc) {
         let mut d = doc.clone();
         d.sample_rate = self.sample_rate;
-        lock(&self.bus).music.stinger(&d);
+        // Render off-lock, then hand the buffers in — the cpal callback only
+        // try_locks the bus, so rendering under the lock would drop a buffer.
+        let p = tono_core::render::render_product(&d);
+        let (left, right) = p.stereo.unwrap_or_else(|| (p.mono.clone(), p.mono));
+        lock(&self.bus).music.stinger_stereo(left, right);
     }
 
     /// Compile a [`Song`](tono_core::song::Song) and play it as an always-on
@@ -283,7 +298,12 @@ impl TonoAudio {
     pub fn stinger_at(&self, doc: &SoundDoc, quantize: Quantize) {
         let mut d = doc.clone();
         d.sample_rate = self.sample_rate;
-        lock(&self.bus).music.stinger_at(&d, quantize);
+        // Render off-lock (see `stinger`); only the scheduling touches the bus.
+        let p = tono_core::render::render_product(&d);
+        let (left, right) = p.stereo.unwrap_or_else(|| (p.mono.clone(), p.mono));
+        lock(&self.bus)
+            .music
+            .stinger_stereo_at(left, right, quantize);
     }
 
     // ---- Horizontal sections ----
@@ -294,7 +314,11 @@ impl TonoAudio {
     pub fn add_section(&self, name: impl Into<String>, doc: &SoundDoc) -> usize {
         let mut d = doc.clone();
         d.sample_rate = self.sample_rate;
-        lock(&self.bus).music.add_section(name, &d)
+        // Render the section bed off-lock, then hand the buffer in — matches
+        // `music_layer` and keeps the cpal callback's try_lock from missing a
+        // buffer on a runtime section-add.
+        let buffer = LoopBuffer::from_doc(&d);
+        lock(&self.bus).music.add_section_buffer(name, buffer)
     }
 
     /// Cross-fade to another section on a beat/bar boundary — horizontal
@@ -442,10 +466,9 @@ pub struct StopNote {
 /// Drain queued [`PlaySfx`] messages and fire them on the audio bus.
 fn play_queued_sfx(mut sfx: MessageReader<PlaySfx>, audio: Res<TonoAudio>) {
     for e in sfx.read() {
-        let voice = audio.play(e.sound);
-        if e.gain != 1.0 {
-            audio.set_gain(voice, e.gain);
-        }
+        // Start at the requested gain rather than ramping up from unity, so a
+        // short SFX doesn't play its attack at the wrong level.
+        audio.play_with_gain(e.sound, e.gain);
     }
 }
 

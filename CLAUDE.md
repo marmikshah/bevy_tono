@@ -54,7 +54,7 @@ and played by handle.
 
 ## Dependency on tono-core
 
-`tono-core` is a **crates.io dependency** (`tono-core = "1.6"`), so the crate is
+`tono-core` is a **crates.io dependency** (`tono-core = "1.7"`), so the crate is
 standalone — it clones, builds, publishes, and CI-tests without the `tono`
 workspace checked out beside it. To hack on the engine and the plugin together
 locally, add a `[patch.crates-io]` override pointing `tono-core` at a local
