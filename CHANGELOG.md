@@ -7,6 +7,12 @@ version history and the git log.
 
 ## Unreleased
 
+### Changed
+- **tono-core 1.7 → 1.10** — the engine's 1.10 line: typed `Song` → `Program`
+  compilation, engine revision 5 (cross-platform byte-identity), the streaming
+  mixer, and the new catalog voices/nodes. No bevy_tono API changes — the
+  1.7-era surface builds warning-free against 1.10.1.
+
 ## 0.3.1 — 2026-07-11
 
 Review follow-ups on the 0.3.0 work; requires **tono-core 1.7**.
