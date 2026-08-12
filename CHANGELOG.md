@@ -5,7 +5,7 @@ format loosely [Keep a Changelog](https://keepachangelog.com). Entries begin
 from the point this file was added — earlier releases live in the crates.io
 version history and the git log.
 
-## Unreleased
+## 0.4.0 — 2026-08-12
 
 ### Changed
 - **tono-core 1.7 → 1.10** — the engine's 1.10 line: typed `Song` → `Program`
