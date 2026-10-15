@@ -5,6 +5,19 @@ format loosely [Keep a Changelog](https://keepachangelog.com). Entries begin
 from the point this file was added — earlier releases live in the crates.io
 version history and the git log.
 
+## 0.5.0 — 2026-10-15
+
+### Changed
+- **tono-core 1.10 → 1.11** — the engine's trimmed 1.11 line: one DSP
+  evaluator shared by the bounce and streaming, modulated filters that stream,
+  stereo reverb tails on live buses and instrument masters, and a smaller node
+  vocabulary. No bevy_tono API changes: the plugin builds, lints and tests
+  clean against 1.11.0.
+- Games that author SoundDocs should check the tono 1.11.0 changelog: the
+  `wavetable`, `bitcrush`, `downsample`, `ringmod`, `flanger`, `phaser`,
+  `duck`, `convolve` and `granular` node types were removed upstream, so a
+  document using one now fails to parse with the type named.
+
 ## 0.4.0 — 2026-08-12
 
 ### Changed
