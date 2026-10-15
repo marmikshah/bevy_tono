@@ -1,6 +1,6 @@
 [package]
 name = "bevy_tono"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -14,7 +14,7 @@ categories = ["game-development", "multimedia::audio"]
 # here means we don't dictate a platform stack to downstream games.
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["std"] }
-tono-core = "1.10"
+tono-core = "1.11"
 cpal = "0.15.3"
 anyhow = "1.0"
 
