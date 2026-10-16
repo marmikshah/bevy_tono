@@ -55,11 +55,12 @@ Run the demo: `cargo run --example play`.
 | method | what it does |
 | --- | --- |
 | `register(&doc) -> Sound` | load a `SoundDoc` once (resampled to the device rate) |
-| `play(sound) -> Voice` | fire a one-shot; the engine reclaims it when done |
+| `play(sound) -> Voice` | fire a one-shot; the engine reclaims it when done (the first play renders, later plays reuse it) |
 | `play_looping(sound)` / `stop(voice)` / `set_gain(voice, g)` | looping voices + control |
 | `music_layer(&doc, fade_in_at)` | add an intensity-gated music stem |
 | `set_intensity(0..1)` | cross-fade the music bed with the action |
 | `stinger(&doc)` | fire a one-shot over the music |
+| `render_stinger(&doc) -> Stinger` / `play_stinger_at(&stinger, q)` | render a stinger on any thread, then fire it — `Quantize::AtBeat(n)` lands it on a beat you computed first |
 | `set_master_gain(0..1)` | global volume — scales the whole bus (SFX + music) |
 | `play_song(&Song)` | compile a catalog [`Song`] and bed it as looping music |
 | `preset(name) -> InstrumentId` | register a live, playable instrument from a factory preset |
@@ -82,7 +83,10 @@ frame. Author a whole song with the catalog + `Song` builder and hand it to
 `play_song`, or play an instrument live — see `cargo run --example keys`.
 
 Audio runs on a dedicated thread that owns the `cpal` stream; the callback only
-`try_lock`s, so a game-thread poke never blocks or clicks the output. With no
+`try_lock`s, so a game-thread poke never blocks or clicks the output. Every
+render happens before the bus lock is taken, so a long one-shot or stinger
+never gaps the music. A render still costs the calling thread its time: for a
+long cue, call `render_stinger` on a worker (`TonoAudio` is `Clone`). With no
 audio device the plugin degrades to silence rather than failing to start.
 
 Sounds are authored as `SoundDoc` JSON — see the

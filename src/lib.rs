@@ -23,9 +23,11 @@
 //!
 //! Audio runs on a dedicated thread that owns the `cpal` stream; the callback
 //! only ever `try_lock`s, so a control-thread poke never blocks (or clicks) the
-//! output. If no audio device is present the plugin degrades to silence rather
-//! than failing to start.
+//! output. Every render — one-shots, stingers, stems, sections — therefore runs
+//! before the bus lock is taken, never under it. If no audio device is present
+//! the plugin degrades to silence rather than failing to start.
 
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -35,7 +37,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tono_core::adaptive::{AdaptiveMusic, LoopBuffer};
 use tono_core::dsl::SoundDoc;
 use tono_core::instrument::{Instrument, InstrumentDesign};
-use tono_core::runtime::{AudioSource, Engine, InstanceHandle, PatchId, Tween};
+use tono_core::runtime::{
+    AudioSource, Engine, InstanceHandle, PatchId, PreparedVoice, Spawn, Tween,
+};
 
 /// The engine, re-exported so a downstream game needs only `bevy_tono` as a
 /// dependency — author sounds with [`tono_core::dsl::SoundDoc`] without wiring
@@ -44,6 +48,9 @@ pub use tono_core;
 /// Beat/bar quantization for scheduled music changes (intensity, stingers,
 /// section swaps), re-exported for convenience.
 pub use tono_core::adaptive::Quantize;
+/// A stinger rendered ahead of time, re-exported for convenience — see
+/// [`TonoAudio::render_stinger`].
+pub use tono_core::adaptive::Stinger;
 /// A pitch for the live instrument layer, re-exported for convenience.
 pub use tono_core::instrument::Note;
 
@@ -143,11 +150,14 @@ pub struct InstrumentId(usize);
 #[derive(Resource, Clone)]
 pub struct TonoAudio {
     bus: Arc<Mutex<GameBus>>,
+    /// One rendered voice per played [`Sound`], so a replay renders nothing.
+    /// A lock of its own: the audio callback never touches it.
+    voices: Arc<Mutex<HashMap<PatchId, PreparedVoice>>>,
     sample_rate: u32,
 }
 
-fn lock(bus: &Arc<Mutex<GameBus>>) -> MutexGuard<'_, GameBus> {
-    bus.lock().unwrap_or_else(|e| e.into_inner())
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl TonoAudio {
@@ -160,25 +170,53 @@ impl TonoAudio {
     }
 
     /// Fire a one-shot — the classic SFX trigger. Returns the voice (for stop /
-    /// gain); the engine reclaims it when it finishes.
+    /// gain); the engine reclaims it when it finishes. The first play of a
+    /// sound renders it on the calling thread, outside the bus lock; later
+    /// plays reuse that render.
     pub fn play(&self, sound: Sound) -> Voice {
-        Voice(lock(&self.bus).engine.play(sound.0))
+        self.spawn(sound, Spawn::default(), 1.0)
     }
 
     /// Fire a one-shot that starts at `gain` (no 20 ms ramp from unity, so a
     /// short/transient SFX honours the level from its very first sample).
     pub fn play_with_gain(&self, sound: Sound, gain: f32) -> Voice {
+        self.spawn(sound, Spawn::default(), gain)
+    }
+
+    /// Start a looping voice (e.g. an ambience bed).
+    pub fn play_looping(&self, sound: Sound) -> Voice {
+        let looping = Spawn {
+            looping: true,
+            ..Spawn::default()
+        };
+        self.spawn(sound, looping, 1.0)
+    }
+
+    /// Spawn a voice with the render kept outside the bus lock: the cpal
+    /// callback only try_locks, so a render under it would silence every
+    /// voice and the music for as long as it took.
+    fn spawn(&self, sound: Sound, how: Spawn, gain: f32) -> Voice {
+        let Some(voice) = self.rendered_voice(sound) else {
+            // Not a patch of this engine: the engine hands back an inert voice.
+            return Voice(lock(&self.bus).engine.play(sound.0));
+        };
         let mut bus = lock(&self.bus);
-        let h = bus.engine.play(sound.0);
+        let h = bus.engine.spawn_prepared(voice, how);
         if gain != 1.0 {
             bus.engine.set_gain(h, gain, Tween::IMMEDIATE);
         }
         Voice(h)
     }
 
-    /// Start a looping voice (e.g. an ambience bed).
-    pub fn play_looping(&self, sound: Sound) -> Voice {
-        Voice(lock(&self.bus).engine.play_looping(sound.0))
+    /// The sound's rendered voice, rendering it on this thread the first time.
+    fn rendered_voice(&self, sound: Sound) -> Option<PreparedVoice> {
+        if let Some(voice) = lock(&self.voices).get(&sound.0) {
+            return Some(voice.clone());
+        }
+        let mut voice = lock(&self.bus).engine.prepare(sound.0)?;
+        voice.render();
+        lock(&self.voices).insert(sound.0, voice.clone());
+        Some(voice)
     }
 
     /// Stop a voice (a short fade avoids a click).
@@ -210,15 +248,30 @@ impl TonoAudio {
         lock(&self.bus).music.set_intensity(intensity);
     }
 
-    /// Fire a one-shot musical stinger over the bed.
+    /// Fire a one-shot musical stinger over the bed. Renders on the calling
+    /// thread; for a long cue use [`render_stinger`](Self::render_stinger) on
+    /// a worker and [`play_stinger`](Self::play_stinger).
     pub fn stinger(&self, doc: &SoundDoc) {
-        let mut d = doc.clone();
-        d.sample_rate = self.sample_rate;
-        // Render off-lock, then hand the buffers in — the cpal callback only
-        // try_locks the bus, so rendering under the lock would drop a buffer.
-        let p = tono_core::render::render_product(&d);
-        let (left, right) = p.stereo.unwrap_or_else(|| (p.mono.clone(), p.mono));
-        lock(&self.bus).music.stinger_stereo(left, right);
+        self.play_stinger(&self.render_stinger(doc));
+    }
+
+    /// Render a stinger at the device rate without touching the bus. Call it
+    /// from any thread (the resource is `Clone`), keep the result, and play it
+    /// as often as you like — a replay neither renders nor copies.
+    pub fn render_stinger(&self, doc: &SoundDoc) -> Stinger {
+        Stinger::render(doc, self.sample_rate)
+    }
+
+    /// Fire a pre-rendered stinger over the bed now.
+    pub fn play_stinger(&self, stinger: &Stinger) {
+        lock(&self.bus).music.play_stinger(stinger);
+    }
+
+    /// Fire a pre-rendered stinger on a beat/bar boundary. Pair it with
+    /// [`Quantize::AtBeat`] to land on a beat computed before the render, so
+    /// the render time cannot push the cue a beat late.
+    pub fn play_stinger_at(&self, stinger: &Stinger, quantize: Quantize) {
+        lock(&self.bus).music.play_stinger_at(stinger, quantize);
     }
 
     /// Compile a [`Song`](tono_core::song::Song) and play it as an always-on
@@ -293,17 +346,12 @@ impl TonoAudio {
         lock(&self.bus).music.set_intensity_at(intensity, quantize);
     }
 
-    /// Fire a stinger on a beat/bar boundary. The stinger is rendered now; only
-    /// its playback is deferred to the boundary.
+    /// Fire a stinger on a beat/bar boundary. The stinger is rendered now, on
+    /// the calling thread; only its playback is deferred to the boundary. A
+    /// relative boundary such as [`Quantize::Beat`] is resolved after that
+    /// render — see [`play_stinger_at`](Self::play_stinger_at) to avoid it.
     pub fn stinger_at(&self, doc: &SoundDoc, quantize: Quantize) {
-        let mut d = doc.clone();
-        d.sample_rate = self.sample_rate;
-        // Render off-lock (see `stinger`); only the scheduling touches the bus.
-        let p = tono_core::render::render_product(&d);
-        let (left, right) = p.stereo.unwrap_or_else(|| (p.mono.clone(), p.mono));
-        lock(&self.bus)
-            .music
-            .stinger_stereo_at(left, right, quantize);
+        self.play_stinger_at(&self.render_stinger(doc), quantize);
     }
 
     // ---- Horizontal sections ----
@@ -494,11 +542,15 @@ pub struct TonoPlugin;
 impl Plugin for TonoPlugin {
     fn build(&self, app: &mut App) {
         let (bus, sample_rate) = spawn_audio();
-        app.insert_resource(TonoAudio { bus, sample_rate })
-            .add_message::<PlaySfx>()
-            .add_message::<PlayNote>()
-            .add_message::<StopNote>()
-            .add_systems(Update, (play_queued_sfx, drain_notes));
+        app.insert_resource(TonoAudio {
+            bus,
+            voices: Arc::default(),
+            sample_rate,
+        })
+        .add_message::<PlaySfx>()
+        .add_message::<PlayNote>()
+        .add_message::<StopNote>()
+        .add_systems(Update, (play_queued_sfx, drain_notes));
     }
 }
 
@@ -847,5 +899,100 @@ mod tests {
         audio.transition_to_section(battle, Quantize::Bar);
         audio.set_intensity_at(1.0, Quantize::Beat);
         audio.stinger_at(&blip(), Quantize::Beat);
+    }
+
+    fn long_phrase() -> SoundDoc {
+        serde_json::from_str(
+            r#"{ "name":"phrase", "duration":12.0, "engine":2, "root": { "type":"mul", "inputs": [
+                { "type":"sawtooth", "freq":220 },
+                { "type":"env", "a":0.01, "d":2.0, "s":0.6, "r":1.0 } ] } }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn play_renders_outside_the_bus_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let (_app, audio) = audio_app();
+        let phrase = audio.register(&long_phrase());
+
+        // Stand in for the cpal callback: try_lock and fill, timing the
+        // longest stretch the bus was unavailable.
+        let done = Arc::new(AtomicBool::new(false));
+        let callback = {
+            let (bus, done) = (audio.bus.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut out = vec![0.0f32; 256 * 2];
+                let mut blocked_since: Option<Instant> = None;
+                let mut longest = Duration::ZERO;
+                while !done.load(Ordering::Relaxed) {
+                    match bus.try_lock() {
+                        Ok(mut b) => {
+                            b.fill(&mut out);
+                            if let Some(t) = blocked_since.take() {
+                                longest = longest.max(t.elapsed());
+                            }
+                        }
+                        Err(_) => {
+                            blocked_since.get_or_insert_with(Instant::now);
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+                longest
+            })
+        };
+
+        let start = Instant::now();
+        let voice = audio.play(phrase); // first play: renders 12 s of audio
+        let render = start.elapsed();
+        done.store(true, Ordering::Relaxed);
+        let longest = callback.join().unwrap();
+
+        assert!(lock(&audio.bus).engine.is_active(voice.0));
+        assert!(
+            longest < render / 2,
+            "the bus was locked for {longest:?} of a {render:?} play"
+        );
+    }
+
+    #[test]
+    fn a_replayed_sound_reuses_its_render() {
+        let (_app, audio) = audio_app();
+        let blip_sound = audio.register(&blip());
+        assert!(lock(&audio.voices).is_empty());
+        audio.play(blip_sound);
+        audio.play_with_gain(blip_sound, 0.5);
+        audio.play_looping(blip_sound);
+        let voices = lock(&audio.voices);
+        assert_eq!(voices.len(), 1, "one render per sound");
+        assert!(voices[&blip_sound.0].is_rendered());
+        assert_eq!(lock(&audio.bus).engine.active(), 3);
+    }
+
+    #[test]
+    fn a_worker_rendered_stinger_fires_on_its_beat() {
+        let (_app, audio) = audio_app();
+        audio.set_music_tempo(120.0, 4); // a beat every 0.5 s
+        let beat = audio.music_beats().floor() as u64 + 2;
+
+        let worker = audio.clone();
+        let stinger = std::thread::spawn(move || worker.render_stinger(&blip()))
+            .join()
+            .unwrap();
+        audio.play_stinger_at(&stinger, Quantize::AtBeat(beat));
+        audio.play_stinger_at(&stinger, Quantize::AtBeat(beat + 1));
+
+        let frames_per_beat = audio.sample_rate() as usize / 2;
+        let fired = |audio: &TonoAudio| lock(&audio.bus).music.active_stingers();
+        assert_eq!(fired(&audio), 0, "waiting for the beat");
+        // No device in tests: advance the bed by filling the bus directly.
+        let mut out = vec![0.0f32; (beat as usize * frames_per_beat + 64) * 2];
+        lock(&audio.bus).fill(&mut out);
+        assert_eq!(fired(&audio), 1, "the first stinger fired on its beat");
+        audio.play_stinger(&stinger); // the same render again, now
+        assert_eq!(fired(&audio), 2);
     }
 }

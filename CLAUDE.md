@@ -46,8 +46,9 @@ and played by handle.
 ## Hard constraints
 
 - The audio callback only ever `try_lock`s the bus — a game-thread poke must
-  never block or click the output. A missing audio device degrades to silence,
-  never a startup failure.
+  never block or click the output, so nothing renders while holding the bus
+  lock (`Engine::prepare`/`spawn_prepared`, `Stinger`, `LoopBuffer` all render
+  first). A missing audio device degrades to silence, never a startup failure.
 - Determinism is tono's contract: the same `SoundDoc` sounds identical every
   run. Don't add nondeterminism (wall-clock, RNG) between the doc and the bus.
 - Open source: keep examples/docs free of any personal or company identifiers.
