@@ -5,11 +5,9 @@ format loosely [Keep a Changelog](https://keepachangelog.com). Entries begin
 from the point this file was added — earlier releases live in the crates.io
 version history and the git log.
 
-## 0.5.0 — Unreleased
+## 0.5.0 — 2026-10-16
 
-Requires tono-core 1.12. Until 1.12.0 is on crates.io, `Cargo.toml` patches
-tono-core to the tono master commit that releases it; the patch goes before
-release.
+Requires tono-core 1.12.
 
 ### Added
 - **`render_stinger`, `play_stinger`, `play_stinger_at`** and the re-exported
