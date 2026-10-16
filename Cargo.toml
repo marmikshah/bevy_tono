@@ -23,3 +23,8 @@ anyhow = "1.0"
 [dev-dependencies]
 bevy = { version = "0.19" }
 serde_json = "1.0"
+
+# Until tono-core 1.12 is on crates.io: the off-lock spawn and prepared
+# stingers come from tono#114. Drop this and require "1.12" before release.
+[patch.crates-io]
+tono-core = { git = "https://github.com/marmikshah/tono", branch = "feat/prepared-voices" }

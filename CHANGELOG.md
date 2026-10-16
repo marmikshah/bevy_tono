@@ -5,7 +5,26 @@ format loosely [Keep a Changelog](https://keepachangelog.com). Entries begin
 from the point this file was added — earlier releases live in the crates.io
 version history and the git log.
 
-## 0.5.0 — 2026-10-15
+## 0.5.0 — Unreleased
+
+Needs tono-core 1.12; until it is published, `Cargo.toml` patches tono-core
+to the tono branch that adds the API.
+
+### Added
+- **`render_stinger`, `play_stinger`, `play_stinger_at`** and the re-exported
+  `Stinger`: render a stinger on any thread without touching the bus, keep
+  it, and fire it any number of times without rendering or copying again.
+- **`Quantize::AtBeat(n)`** (from tono-core): schedule on an absolute beat
+  counted from `music_reset`, so a cue rendered on a worker lands on the beat
+  it was written for instead of the beat after its render.
+
+### Fixed
+- **`play`, `play_with_gain`, `play_looping` no longer render under the bus
+  lock.** The cpal callback only `try_lock`s, so a long one-shot silenced all
+  output (music, stingers, voices) for the length of its render. The render
+  now runs first, once per sound; later plays reuse it.
+- **`stinger_at` schedules through tono-core's prepared stinger**, so a
+  scheduled stinger no longer allocates on the audio thread when it fires.
 
 ### Changed
 - **tono-core 1.10 → 1.11** — the engine's trimmed 1.11 line: one DSP
