@@ -1,13 +1,15 @@
 # Canonical Rust CI. Mirrors the local gate (make pre-commit-checks + test).
+# release.yml calls it as its gate on the commit being released.
 name: CI
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  workflow_call:
 
 jobs:
   checks:
-    if: github.event.pull_request.draft == false
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,7 +25,7 @@ jobs:
       - run: make pre-commit-checks
 
   tests:
-    if: github.event.pull_request.draft == false
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

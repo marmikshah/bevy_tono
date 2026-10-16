@@ -21,8 +21,18 @@ and played by handle.
 | `make test` | test suite |
 | `make pre-commit-checks` | `cargo fmt --check` + clippy `-D warnings` (what the hooks run) |
 | `make hooks` | install the git hooks |
-| `make release` | tag a clean `master` → CI publishes to crates.io |
 | `make clean` | wipe build artifacts |
+
+## Releasing
+
+Releases are a manual GitHub Actions run, never a local tag: on `master`,
+bump `version` in `Cargo.toml` and date its `## X.Y.Z — YYYY-MM-DD` section
+in `CHANGELOG.md` (through a PR), then **Actions → Release → Run workflow**.
+`release.yml` refuses a dispatch that is not the live `master`, a version
+already tagged or on crates.io, an undated changelog entry, or a `Cargo.toml`
+with a `[patch]` section. It reruns CI on the commit, then the `production`
+job runs `cargo publish` and creates the `vX.Y.Z` tag and GitHub Release from
+that changelog section. A failed run can be re-run; finished steps are skipped.
 
 ## Architecture
 
