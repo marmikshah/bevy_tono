@@ -8,7 +8,8 @@ version history and the git log.
 ## 0.5.0 — Unreleased
 
 Requires tono-core 1.12. Until 1.12.0 is on crates.io, `Cargo.toml` patches
-tono-core to tono's `release/1.12.0` branch; the patch goes before release.
+tono-core to the tono master commit that releases it; the patch goes before
+release.
 
 ### Added
 - **`render_stinger`, `play_stinger`, `play_stinger_at`** and the re-exported
