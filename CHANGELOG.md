@@ -7,8 +7,8 @@ version history and the git log.
 
 ## 0.5.0 — Unreleased
 
-Needs tono-core 1.12; until it is published, `Cargo.toml` patches tono-core
-to the tono branch that adds the API.
+Requires tono-core 1.12. Until 1.12.0 is on crates.io, `Cargo.toml` patches
+tono-core to tono's `release/1.12.0` branch; the patch goes before release.
 
 ### Added
 - **`render_stinger`, `play_stinger`, `play_stinger_at`** and the re-exported
@@ -27,6 +27,8 @@ to the tono branch that adds the API.
   scheduled stinger no longer allocates on the audio thread when it fires.
 
 ### Changed
+- **tono-core 1.11 → 1.12** — the off-lock `Engine::prepare`/`spawn_prepared`,
+  the shared `Stinger` and `Quantize::AtBeat` this release builds on.
 - **tono-core 1.10 → 1.11** — the engine's trimmed 1.11 line: one DSP
   evaluator shared by the bounce and streaming, modulated filters that stream,
   stereo reverb tails on live buses and instrument masters, and a smaller node

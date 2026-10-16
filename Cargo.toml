@@ -14,7 +14,7 @@ categories = ["game-development", "multimedia::audio"]
 # here means we don't dictate a platform stack to downstream games.
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["std"] }
-tono-core = "1.11"
+tono-core = "1.12"
 cpal = "0.15.3"
 anyhow = "1.0"
 
@@ -24,7 +24,7 @@ anyhow = "1.0"
 bevy = { version = "0.19" }
 serde_json = "1.0"
 
-# Until tono-core 1.12 is on crates.io: the off-lock spawn and prepared
-# stingers come from tono#114. Drop this and require "1.12" before release.
+# Until tono-core 1.12.0 is on crates.io, build against its release branch
+# (tono#115). Delete this section before `make release`.
 [patch.crates-io]
-tono-core = { git = "https://github.com/marmikshah/tono", branch = "feat/prepared-voices" }
+tono-core = { git = "https://github.com/marmikshah/tono", branch = "release/1.12.0" }
