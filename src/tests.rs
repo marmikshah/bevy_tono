@@ -905,3 +905,48 @@ fn levels_map_onto_gain_and_balance() {
         );
     }
 }
+
+#[test]
+fn prewarm_renders_off_the_calling_thread() {
+    use std::time::{Duration, Instant};
+
+    let (audio, mut mixer) = manual();
+    let phrase = audio.register(&long_phrase());
+    let varied = audio.register_with(
+        &blip(),
+        Variation {
+            pitch: 0.05,
+            ..Variation::default()
+        },
+    );
+    let start = Instant::now();
+    audio.prewarm(phrase);
+    audio.prewarm(varied);
+    let returned = start.elapsed();
+    let ready = |audio: &TonoAudio| {
+        lock(&audio.inner.voices).contains_key(&phrase.0)
+            && lock(&audio.inner.samples).contains_key(&varied.0)
+    };
+    while !ready(&audio) {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "prewarm finished"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let rendered = start.elapsed();
+    assert!(
+        returned < rendered / 4,
+        "returned in {returned:?} of {rendered:?}"
+    );
+
+    // The first play now reuses the render.
+    let start = Instant::now();
+    audio.play(phrase);
+    assert!(
+        start.elapsed() < rendered / 4,
+        "no render on the first play"
+    );
+    pull(&mut mixer, 64);
+    assert_eq!(mixer.engine.active(), 1);
+}
