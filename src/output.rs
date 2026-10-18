@@ -59,7 +59,7 @@ fn open_stream(config: &TonoConfig) -> anyhow::Result<(cpal::Stream, TonoAudio)>
     let supported = device.default_output_config()?;
     let format = supported.sample_format();
     let stream_config: cpal::StreamConfig = supported.into();
-    let (audio, mixer) = TonoAudio::with_mixer(stream_config.sample_rate.0, config);
+    let (audio, mixer) = TonoAudio::with_mixer(stream_config.sample_rate, config);
     let stream = match format {
         cpal::SampleFormat::F32 => build::<f32>(&device, &stream_config, mixer)?,
         cpal::SampleFormat::I16 => build::<i16>(&device, &stream_config, mixer)?,
