@@ -68,6 +68,7 @@ pub(crate) enum Command {
         priority: Priority,
     },
     Stop(u64),
+    MaxVoices(usize),
     Gain(u64, f32),
     Layer(LoopBuffer, f32),
     Intensity(f32),
@@ -250,6 +251,7 @@ impl Mixer {
                         .push(SampledVoice::new(voice, slot, sampled, sr));
                 }
             }
+            Command::MaxVoices(max) => self.engine.set_max_voices(max),
             Command::Stop(voice) => {
                 if let Some(h) = self.handle(voice) {
                     self.engine.stop(h, Tween::ms(8.0, sr));
@@ -324,7 +326,7 @@ impl Mixer {
         });
     }
 
-    fn handle(&self, voice: u64) -> Option<InstanceHandle> {
+    pub(crate) fn handle(&self, voice: u64) -> Option<InstanceHandle> {
         self.voices
             .iter()
             .find(|(id, _)| *id == voice)
