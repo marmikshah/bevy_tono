@@ -3,7 +3,7 @@
 # the sole entrypoint; the git hooks call `make pre-commit-checks` / `make test`.
 
 .DEFAULT_GOAL := help
-.PHONY: help hooks run test pre-commit-checks branding clean
+.PHONY: help hooks run test pre-commit-checks clean
 
 help: ## Show this help.
 	@awk 'BEGIN{FS=":.*##"; printf "Usage: make \033[36m<target>\033[0m\n\nTargets:\n"} \
@@ -23,9 +23,6 @@ test: ## Run the test suite.
 pre-commit-checks: ## Format-check + clippy gate. Exactly what the git hooks run.
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features -- -D warnings
-
-branding: ## No marketing surface for a library. Documented no-op (target exists per standard).
-	@echo "bevy_tono is a library — no branding surface."
 
 clean: ## Wipe build artifacts.
 	cargo clean
