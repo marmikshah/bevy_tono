@@ -21,11 +21,17 @@ version history and the git log.
   cap and stealing, applied to every voice, resampled ones included.
 - **`set_music_gain(gain, ramp)`**: a ramped music-bus gain, separate from the
   duck and intensity.
-- **`TonoConfig`**, read when the plugin starts: an optional output `Limiter`
-  and `pause_music_on_focus_loss`. Both off by default.
+- **`TonoConfig`**, read when the plugin starts: an optional output `Limiter`,
+  `pause_music_on_focus_loss` with its `focus_fade` (45 ms by default), and
+  `output: Output::Device | Output::Headless`. Headless never opens a device
+  and drains the same mixer in real time. Everything is off by default.
+- **`music_pause_fading(fade)`, `music_resume_fading(fade)`**: fade the music
+  out and pause it on the frame the fade lands (on the audio thread), or
+  resume it and fade it back in.
 - **`set_levels(voice, [left, right], ramp)`**: slewed, panned levels for a
   looping bed. Beds play through `music_pause` and `music_reset`.
-- **`prewarm(sound)`**: render a sound on a background thread.
+- **`prewarm(sound)`**: queue a sound for one long-lived background worker,
+  which renders everything a first play needs, any rate included.
 - **`transition_to_section_with(section, quantize, SectionEntry)`**: resume a
   section where it left off, and/or count `Beat`/`Bar`/`Bars(n)` from the
   sounding section's entry.
@@ -46,6 +52,9 @@ version history and the git log.
   layer); with the default entry they sound exactly as before.
 - The lib takes bevy's `bevy_window` feature, for the focus and lifecycle
   messages.
+- **cpal 0.15 → 0.17**, the version bevy 0.19's `bevy_audio` uses. Both
+  declared `links = "alsa"` through different alsa-sys versions, so a game
+  could not enable `bevy_audio` alongside bevy_tono; now they share one.
 
 ## 0.6.0 — 2026-10-18
 
