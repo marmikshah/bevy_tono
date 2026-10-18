@@ -82,9 +82,10 @@ pub(crate) enum Command {
     IntensityAt(f32, Quantize),
     Stinger(Stinger),
     StingerAt(Stinger, Quantize),
-    Pause(bool),
-    /// Hold the music while the app is unfocused or suspended.
-    Suspend(bool),
+    /// Pause or resume the music, fading over this many frames first.
+    Pause(bool, u32),
+    /// Hold the music while the app is unfocused or suspended, with a fade.
+    Suspend(bool, u32),
     Reset(u64),
     Tempo(f32, u32),
     Duck(f32, Duration),
@@ -155,6 +156,8 @@ pub(crate) struct Mixer {
     scratch: Vec<f32>,
     master_gain: Ramp,
     music_gain: Ramp,
+    /// The fade a held bed goes silent through before it pauses.
+    hold: Ramp,
     limiter: Option<LimiterState>,
     /// The newest reset applied, published with the position it produced.
     reset_seen: u64,
@@ -189,6 +192,7 @@ impl Mixer {
             scratch: vec![0.0; SCRATCH_FRAMES * 2],
             master_gain: Ramp::new(1.0),
             music_gain: Ramp::new(1.0),
+            hold: Ramp::new(1.0),
             limiter: config.limiter.map(|l| LimiterState::new(l, sample_rate)),
             reset_seen: 0,
             paused: false,
@@ -211,14 +215,26 @@ impl Mixer {
             self.scratch.resize(len, 0.0);
         }
         // Add the music bed, then each live instrument, through the scratch.
-        self.music.fill(&mut self.scratch[..len]);
+        // A held bed pauses on the frame its fade lands, mid-block or not.
+        let frames = len / 2;
+        let fading_out = self.holding() && !self.music.is_paused();
+        let until = if fading_out {
+            (self.hold.remaining() as usize).min(frames)
+        } else {
+            frames
+        };
+        self.music.fill(&mut self.scratch[..until * 2]);
+        if fading_out && until < frames {
+            self.music.pause();
+            self.music.fill(&mut self.scratch[until * 2..len]);
+        }
         for (o, s) in out
             .as_chunks_mut::<2>()
             .0
             .iter_mut()
             .zip(self.scratch[..len].as_chunks::<2>().0)
         {
-            let g = self.music_gain.tick();
+            let g = self.music_gain.tick() * self.hold.tick();
             o[0] += s[0] * g;
             o[1] += s[1] * g;
         }
@@ -328,13 +344,13 @@ impl Mixer {
             Command::IntensityAt(x, q) => self.music.set_intensity_at(finite_or_zero(x), q),
             Command::Stinger(stinger) => self.music.play_stinger(&stinger),
             Command::StingerAt(stinger, q) => self.music.play_stinger_at(&stinger, q),
-            Command::Pause(paused) => {
+            Command::Pause(paused, fade) => {
                 self.paused = paused;
-                self.hold_music();
+                self.hold_music(fade);
             }
-            Command::Suspend(suspended) => {
+            Command::Suspend(suspended, fade) => {
                 self.suspended = suspended;
-                self.hold_music();
+                self.hold_music(fade);
             }
             Command::Reset(epoch) => {
                 self.music.reset();
@@ -372,12 +388,22 @@ impl Mixer {
         }
     }
 
-    /// Pause the bed while the game or the app's focus asks for it.
-    fn hold_music(&mut self) {
-        if self.paused || self.suspended {
-            self.music.pause();
+    fn holding(&self) -> bool {
+        self.paused || self.suspended
+    }
+
+    /// Pause the bed while the game or the app's focus asks for it: fade it
+    /// out over `fade` frames and pause it when the fade lands (`fill` does
+    /// that), or resume it at once and fade it back in.
+    fn hold_music(&mut self, fade: u32) {
+        if self.holding() {
+            self.hold.to(0.0, fade);
+            if fade == 0 {
+                self.music.pause();
+            }
         } else {
             self.music.resume();
+            self.hold.to(1.0, fade);
         }
     }
 
@@ -466,6 +492,11 @@ impl Ramp {
             }
         }
         self.value
+    }
+
+    /// Frames left until the target.
+    pub(crate) fn remaining(&self) -> u32 {
+        self.remaining
     }
 
     pub(crate) fn at_target(&self) -> bool {
