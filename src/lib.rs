@@ -1014,6 +1014,20 @@ pub struct TonoConfig {
     /// the game left it, and [`music_is_paused`](TonoAudio::music_is_paused)
     /// reports only that. SFX and beds keep playing. Off by default.
     pub pause_music_on_focus_loss: bool,
+    /// Where the mix goes: the default output device, or nowhere.
+    pub output: Output,
+}
+
+/// Where [`TonoPlugin`] sends the mix.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Output {
+    /// The default output device; with none, a headless drain as below.
+    #[default]
+    Device,
+    /// No device is opened. The same mixer drains in real time into
+    /// silence at 48 kHz, so the music clock, beats and quantized changes
+    /// behave as with a device — for desktop captures, CI and tests.
+    Headless,
 }
 
 /// A stereo-linked peak limiter on the output: it pulls the gain down at

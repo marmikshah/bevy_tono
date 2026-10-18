@@ -1191,3 +1191,28 @@ fn tone(freq: u32) -> SoundDoc {
     d.sample_rate = 48_000;
     d
 }
+
+#[test]
+fn headless_output_runs_the_mixer_without_a_device() {
+    use std::time::{Duration, Instant};
+
+    let mut app = App::new();
+    app.insert_resource(TonoConfig {
+        output: Output::Headless,
+        ..TonoConfig::default()
+    })
+    .add_plugins(MinimalPlugins)
+    .add_plugins(TonoPlugin);
+    let audio = app.world().resource::<TonoAudio>().clone();
+    assert_eq!(audio.sample_rate(), FALLBACK_SAMPLE_RATE);
+    audio.set_music_tempo(120.0, 4);
+    let start = Instant::now();
+    while audio.music_position_frames() < 4_800 {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the clock advances"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(audio.music_beats() > 0.0);
+}

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::mixer::Mixer;
-use crate::{FALLBACK_SAMPLE_RATE, TonoAudio, TonoConfig};
+use crate::{FALLBACK_SAMPLE_RATE, Output, TonoAudio, TonoConfig};
 
 /// Frames the callback mixes per pass. The scratch is fixed at this size, so
 /// any device buffer is served in chunks without allocating.
@@ -18,7 +18,8 @@ const DRAIN_TICK: Duration = Duration::from_millis(10);
 
 /// Spawn the audio thread and return the resource that talks to its mixer.
 /// Never fails: a missing device, or a format it cannot open, degrades to a
-/// silent drain at [`FALLBACK_SAMPLE_RATE`].
+/// silent drain at [`FALLBACK_SAMPLE_RATE`]. [`Output::Headless`] goes
+/// straight to that drain without touching the device.
 pub(crate) fn spawn_audio(config: &TonoConfig) -> TonoAudio {
     let (ready, result) = std::sync::mpsc::sync_channel(1);
     let thread_config = config.clone();
@@ -26,15 +27,17 @@ pub(crate) fn spawn_audio(config: &TonoConfig) -> TonoAudio {
         .name("bevy_tono-audio".into())
         .spawn(move || {
             // The stream stays on the thread that built it: some hosts need that.
-            match open_stream(&thread_config) {
-                Ok((stream, audio)) => {
-                    ready.send(audio).ok();
-                    let _stream = stream;
-                    loop {
-                        std::thread::park();
+            if thread_config.output == Output::Device {
+                match open_stream(&thread_config) {
+                    Ok((stream, audio)) => {
+                        ready.send(audio).ok();
+                        let _stream = stream;
+                        loop {
+                            std::thread::park();
+                        }
                     }
+                    Err(e) => eprintln!("bevy_tono: audio disabled ({e})"),
                 }
-                Err(e) => eprintln!("bevy_tono: audio disabled ({e})"),
             }
             let (audio, mixer) = TonoAudio::with_mixer(FALLBACK_SAMPLE_RATE, &thread_config);
             ready.send(audio).ok();
