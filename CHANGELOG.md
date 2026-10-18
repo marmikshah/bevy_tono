@@ -5,6 +5,18 @@ format loosely [Keep a Changelog](https://keepachangelog.com). Entries begin
 from the point this file was added — earlier releases live in the crates.io
 version history and the git log.
 
+## 0.6.0 — 2026-10-18
+
+Still requires tono-core 1.12. No public API changes.
+
+### Changed
+- The README now has a Contributing section: make targets, examples, the
+  layout of `src/lib.rs`, the tono-core `[patch]` recipe and how to release.
+- Internal cleanup: one helper for the instrument lookup behind
+  `note_on`/`note_off`/`set_bend`, one named 48 kHz fallback rate, and shared
+  test setup. Behaviour is unchanged.
+- CI runs its checks and tests in a single job.
+
 ## 0.5.0 — 2026-10-16
 
 Requires tono-core 1.12.
