@@ -9,11 +9,12 @@ repository = "https://github.com/marmikshah/bevy_tono"
 keywords = ["bevy", "audio", "sound", "gamedev", "synthesis"]
 categories = ["game-development", "multimedia::audio"]
 
-# The lib asks for the MINIMAL bevy surface (App/ECS only) — the game brings its
+# The lib asks for the MINIMAL bevy surface (App/ECS, plus bevy_window's
+# focus and lifecycle messages) — the game brings its
 # own bevy with its own features and cargo unifies. Keeping render/winit out of
 # here means we don't dictate a platform stack to downstream games.
 [dependencies]
-bevy = { version = "0.19", default-features = false, features = ["std"] }
+bevy = { version = "0.19", default-features = false, features = ["std", "bevy_window"] }
 tono-core = "1.12"
 cpal = "0.15.3"
 anyhow = "1.0"
