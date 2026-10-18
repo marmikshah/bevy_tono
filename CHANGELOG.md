@@ -5,7 +5,10 @@ format loosely [Keep a Changelog](https://keepachangelog.com). Entries begin
 from the point this file was added — earlier releases live in the crates.io
 version history and the git log.
 
-## Unreleased
+## 0.7.0 — 2026-10-18
+
+Requires tono-core 1.12. The 0.6 API keeps compiling and mixing the same;
+`PlaySfx` gained public fields, so a struct literal needs `..`.
 
 ### Added
 - **`play_with(sound, Play)`**: per-play `gain`, `pan`, `rate`, `lowpass_hz`,
