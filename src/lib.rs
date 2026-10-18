@@ -700,6 +700,10 @@ mod tests {
         .unwrap()
     }
 
+    fn peak(out: &[f32]) -> f32 {
+        out.iter().fold(0.0f32, |m, &x| m.max(x.abs()))
+    }
+
     #[test]
     fn bus_plays_a_registered_sfx() {
         let mut bus = GameBus::new(48_000);
@@ -707,8 +711,7 @@ mod tests {
         bus.engine.play(patch);
         let mut out = vec![0.0f32; 512 * 2];
         bus.fill(&mut out);
-        let peak = out.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        assert!(peak > 0.0, "the SFX sounds through the bus");
+        assert!(peak(&out) > 0.0, "the SFX sounds through the bus");
     }
 
     #[test]
@@ -729,23 +732,19 @@ mod tests {
         bus.master_gain = 0.0;
         let mut out = vec![0.0f32; 512 * 2];
         bus.fill(&mut out);
-        let peak = out.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        assert_eq!(peak, 0.0, "master gain 0 mutes the bus");
+        assert_eq!(peak(&out), 0.0, "master gain 0 mutes the bus");
     }
 
     #[test]
     fn ecs_layer_plays_sfx_and_beds_a_song() {
-        use bevy::MinimalPlugins;
-        use bevy::app::App;
         use tono_core::dsl::{Adsr, SeqWave};
         use tono_core::song::{Song, note};
 
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins).add_plugins(TonoPlugin);
+        let (mut app, audio) = audio_app();
 
         // PlaySfx: a registered sound fired via the message queue is drained and
         // played by the plugin's system on update — without panicking.
-        let sound = app.world().resource::<TonoAudio>().register(&blip());
+        let sound = audio.register(&blip());
         app.world_mut()
             .write_message(PlaySfx::new(sound).with_gain(0.7));
         app.update();
@@ -765,39 +764,27 @@ mod tests {
         );
         song.add_pattern("r", 1, vec![note(0, 4, "C2"), note(8, 4, "G2")]);
         song.arrange("bass", "r", 0);
-        assert!(
-            app.world().resource::<TonoAudio>().play_song(&song).is_ok(),
-            "the song compiles and beds"
-        );
+        assert!(audio.play_song(&song).is_ok(), "the song compiles and beds");
     }
 
     #[test]
     fn live_instrument_plays_a_held_note() {
-        use bevy::MinimalPlugins;
-        use bevy::app::App;
-
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins).add_plugins(TonoPlugin);
+        let (mut app, audio) = audio_app();
 
         // Register a preset instrument and play a note by message.
-        let inst = app
-            .world()
-            .resource::<TonoAudio>()
-            .preset("vibrato_lead")
-            .expect("the preset exists");
+        let inst = audio.preset("vibrato_lead").expect("the preset exists");
         app.world_mut()
             .write_message(PlayNote::new(inst, Note::C4).with_velocity(0.9));
         app.update(); // drain_notes fires note_on
 
         // A held note sustains — pull a few buffers and confirm it sounds.
-        let bus = app.world().resource::<TonoAudio>().bus.clone();
-        let mut peak = 0.0f32;
+        let mut loudest = 0.0f32;
         for _ in 0..8 {
             let mut out = vec![0.0f32; 512 * 2];
-            lock(&bus).fill(&mut out);
-            peak = peak.max(out.iter().fold(0.0f32, |m, &x| m.max(x.abs())));
+            lock(&audio.bus).fill(&mut out);
+            loudest = loudest.max(peak(&out));
         }
-        assert!(peak > 0.0, "the held instrument note sounds");
+        assert!(loudest > 0.0, "the held instrument note sounds");
     }
 
     #[test]
@@ -807,14 +794,9 @@ mod tests {
         let mut doc = blip();
         doc.sample_rate = 48_000;
 
-        // A single doc renders + grades (no device) to a Review with findings
-        // and one of the three overall grades.
+        // A single doc renders + grades (no device) to a Review with findings.
         let r = review::grade(&doc, Some(Archetype::Ui));
         assert!(!r.findings.is_empty(), "the review produced findings");
-        assert!(matches!(
-            r.grade,
-            Status::Pass | Status::Warn | Status::Fail
-        ));
 
         // The batch API pairs each name with its review; the gate predicate
         // reflects the worst grade in the set.
@@ -833,8 +815,6 @@ mod tests {
     }
 
     fn audio_app() -> (App, TonoAudio) {
-        use bevy::MinimalPlugins;
-        use bevy::app::App;
         let mut app = App::new();
         app.add_plugins(MinimalPlugins).add_plugins(TonoPlugin);
         let audio = app.world().resource::<TonoAudio>().clone();
@@ -843,20 +823,19 @@ mod tests {
 
     #[test]
     fn transport_position_pause_and_reset() {
-        let (app, audio) = audio_app();
+        let (_app, audio) = audio_app();
         audio.music_layer(&blip(), 0.0); // an always-on stem so the clock advances
 
         assert_eq!(audio.music_position_frames(), 0);
         assert!(!audio.music_is_paused());
 
         // No audio device in tests — advance the bed by filling the bus directly.
-        let bus = app.world().resource::<TonoAudio>().bus.clone();
-        lock(&bus).fill(&mut vec![0.0f32; 256 * 2]);
+        lock(&audio.bus).fill(&mut vec![0.0f32; 256 * 2]);
         assert_eq!(audio.music_position_frames(), 256, "the clock advances");
 
         audio.music_pause();
         assert!(audio.music_is_paused());
-        lock(&bus).fill(&mut vec![0.0f32; 256 * 2]);
+        lock(&audio.bus).fill(&mut vec![0.0f32; 256 * 2]);
         assert_eq!(
             audio.music_position_frames(),
             256,
