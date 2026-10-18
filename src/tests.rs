@@ -913,22 +913,14 @@ fn prewarm_renders_off_the_calling_thread() {
 
     let (audio, mut mixer) = manual();
     let phrase = audio.register(&long_phrase());
-    let varied = audio.register_with(
-        &blip(),
-        Variation {
-            pitch: 0.05,
-            ..Variation::default()
-        },
-    );
     let start = Instant::now();
     audio.prewarm(phrase);
-    audio.prewarm(varied);
     let returned = start.elapsed();
-    let ready = |audio: &TonoAudio| {
-        lock(&audio.inner.voices).contains_key(&phrase.0)
-            && lock(&audio.inner.samples).contains_key(&varied.0)
+    let ready = |audio: &TonoAudio, sound: Sound| {
+        lock(&audio.inner.voices).contains_key(&sound.0)
+            && lock(&audio.inner.samples).contains_key(&sound.0)
     };
-    while !ready(&audio) {
+    while !ready(&audio, phrase) {
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "prewarm finished"
@@ -941,23 +933,51 @@ fn prewarm_renders_off_the_calling_thread() {
         "returned in {returned:?} of {rendered:?}"
     );
 
-    // The first play now reuses the render.
+    // Both first plays now reuse the render: plain, and at any rate.
     let start = Instant::now();
     audio.play(phrase);
+    for rate in [0.5, 1.25, 2.0] {
+        audio.play_with(
+            phrase,
+            Play {
+                rate,
+                ..Play::default()
+            },
+        );
+    }
     assert!(
         start.elapsed() < rendered / 4,
-        "no render on the first play"
+        "no render on the first plays"
     );
     pull(&mut mixer, 64);
-    assert_eq!(mixer.engine.active(), 1);
+    assert_eq!(mixer.engine.active(), 4);
+    assert_eq!(mixer.sampled.len(), 3, "every rate reads the one buffer");
+    assert_eq!(lock(&audio.inner.samples).len(), 1);
 }
 
-fn tone(freq: u32) -> SoundDoc {
-    let mut d = doc(&format!(
-        r#"{{ "name":"t{freq}", "duration":0.5, "engine":2, "root": {{ "type":"sine", "freq":{freq} }} }}"#
-    ));
-    d.sample_rate = 48_000;
-    d
+#[test]
+fn prewarm_uses_one_worker_for_many_sounds() {
+    use std::time::{Duration, Instant};
+
+    let (audio, _mixer) = manual();
+    let sounds: Vec<Sound> = (0..45).map(|_| audio.register(&blip())).collect();
+    for &s in &sounds {
+        audio.prewarm(s);
+    }
+    let start = Instant::now();
+    while lock(&audio.inner.samples).len() < sounds.len() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "prewarm finished"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(lock(&audio.inner.voices).len(), sounds.len());
+    assert_eq!(
+        audio.inner.prewarm_workers.load(Ordering::Relaxed),
+        1,
+        "one worker for all 45"
+    );
 }
 
 #[test]
@@ -1163,4 +1183,11 @@ fn focus_is_ignored_unless_asked_for() {
     app.update();
     pull(&mut mixer, 1_000);
     assert_eq!(audio.music_position_frames(), 1_000);
+}
+fn tone(freq: u32) -> SoundDoc {
+    let mut d = doc(&format!(
+        r#"{{ "name":"t{freq}", "duration":0.5, "engine":2, "root": {{ "type":"sine", "freq":{freq} }} }}"#
+    ));
+    d.sample_rate = 48_000;
+    d
 }
