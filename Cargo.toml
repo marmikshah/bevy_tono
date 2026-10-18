@@ -16,7 +16,7 @@ categories = ["game-development", "multimedia::audio"]
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["std", "bevy_window"] }
 tono-core = "1.12"
-cpal = "0.15.3"
+cpal = "0.17.1"
 anyhow = "1.0"
 
 # Examples need a real windowed app; that platform stack lives here so the lib
