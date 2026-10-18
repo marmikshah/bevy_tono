@@ -93,6 +93,43 @@ Sounds are authored as `SoundDoc` JSON — see the
 [tono cookbook](https://github.com/marmikshah/tono/blob/master/docs/cookbook.md)
 for the vocabulary.
 
+## Contributing
+
+`make` is the entry point; `make help` lists the targets.
+
+```sh
+make test                 # unit tests + doctests; no audio device needed
+make pre-commit-checks    # cargo fmt --check + clippy -D warnings (what CI runs)
+make hooks                # run those before each commit and push
+make run                  # the play example: SPACE blips, the music breathes
+cargo run --example keys  # A–K play a live instrument
+```
+
+On Linux, Bevy's examples need `libasound2-dev libudev-dev libwayland-dev
+libxkbcommon-dev`.
+
+Everything lives in `src/lib.rs`: `TonoPlugin` and `TonoAudio`, the
+`PlaySfx` / `PlayNote` / `StopNote` messages, `GameBus` (the SFX engine, music
+bed and instruments summed to stereo), the cpal thread (`spawn_audio` →
+`build_stream` → `fill_output`), and the `review` module. The tests sit at the
+bottom of that file and drive `GameBus`, or `TonoPlugin` under
+`MinimalPlugins`, with no device. The demos are in `examples/`.
+
+To work on tono-core alongside the plugin, point cargo at a local checkout,
+and don't commit it (a release refuses a `[patch]`):
+
+```toml
+[patch.crates-io]
+tono-core = { path = "../tono/crates/tono-core" }
+```
+
+**Releasing.** Bump `version` in `Cargo.toml` and date its
+`## X.Y.Z — YYYY-MM-DD` section in `CHANGELOG.md` through a PR. Once it is on
+`master`, run **Actions → Release → Run workflow**. The workflow checks the
+version is new and the changelog dated, reruns CI, then publishes to
+crates.io and creates the `vX.Y.Z` tag and GitHub Release from that
+changelog section. A failed run can be re-run; finished steps are skipped.
+
 ## License
 
 Released under the [MIT License](LICENSE).
