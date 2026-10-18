@@ -251,6 +251,10 @@ struct Inner {
     next_voice: AtomicU64,
     /// The variation generator's state (xorshift32).
     random: AtomicU32,
+    /// The queue to the prewarm worker, started on the first prewarm.
+    prewarm: std::sync::OnceLock<mpsc::Sender<Sound>>,
+    /// Prewarm workers started (one per resource, at most).
+    prewarm_workers: std::sync::atomic::AtomicUsize,
     sample_rate: u32,
 }
 
@@ -302,6 +306,8 @@ impl TonoAudio {
                 slot,
                 next_voice: AtomicU64::new(1),
                 random: AtomicU32::new(0x7f4a_7c15),
+                prewarm: std::sync::OnceLock::new(),
+                prewarm_workers: std::sync::atomic::AtomicUsize::new(0),
                 sample_rate,
             }),
         };
@@ -337,26 +343,43 @@ impl TonoAudio {
         sound
     }
 
-    /// Render `sound` on a background thread, so its first play costs the
-    /// game thread nothing. Renders what a plain play needs, plus the sample
-    /// buffer a resampled play needs when the sound carries a
-    /// [`Variation`]. A play that arrives before the render finishes renders
-    /// it itself, as without a prewarm.
+    /// Queue `sound` to render on bevy_tono's prewarm worker, so its first
+    /// play costs the game thread nothing. One long-lived worker serves every
+    /// prewarm in order, however many a game queues at launch.
+    ///
+    /// It renders everything a first play can need: the engine's voice for a
+    /// plain play, and the sound's base buffer for a play with a rate or a
+    /// lowpass. The resample itself needs no render: the audio thread reads
+    /// that one buffer at any rate (linear interpolation, no allocation), so
+    /// every rate shares it. A play that arrives before its prewarm finishes
+    /// renders on its own thread, as without a prewarm.
     pub fn prewarm(&self, sound: Sound) {
-        let audio = self.clone();
-        // With no thread to spare, the first play renders, as before.
+        let worker = self
+            .inner
+            .prewarm
+            .get_or_init(|| self.spawn_prewarm_worker());
+        // With no worker (no thread to spare), the first play renders.
+        worker.send(sound).ok();
+    }
+
+    /// Start the prewarm worker. It holds the resource weakly, so it ends
+    /// once the last `TonoAudio` is dropped.
+    fn spawn_prewarm_worker(&self) -> mpsc::Sender<Sound> {
+        let (tx, rx) = mpsc::channel::<Sound>();
+        let inner = Arc::downgrade(&self.inner);
+        self.inner.prewarm_workers.fetch_add(1, Ordering::Relaxed);
         std::thread::Builder::new()
             .name("bevy_tono-prewarm".into())
             .spawn(move || {
-                audio.rendered_voice(sound);
-                let varied = lock(&audio.inner.registry)
-                    .variations
-                    .contains_key(&sound.0);
-                if varied {
+                while let Ok(sound) = rx.recv() {
+                    let Some(inner) = inner.upgrade() else { return };
+                    let audio = TonoAudio { inner };
+                    audio.rendered_voice(sound);
                     audio.samples(sound);
                 }
             })
             .ok();
+        tx
     }
 
     /// The next variation offset, uniform in −1..1.
