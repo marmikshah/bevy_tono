@@ -9,9 +9,11 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use tono_core::adaptive::{AdaptiveMusic, LoopBuffer, Quantize, Stinger};
-use tono_core::dsl::SoundDoc;
+use tono_core::dsl::{Node, SoundDoc};
 use tono_core::instrument::{Instrument, Note};
-use tono_core::runtime::{AudioSource, Engine, InstanceHandle, PreparedVoice, Spawn, Tween};
+use tono_core::runtime::{
+    AudioSource, Engine, InstanceHandle, PatchId, PreparedVoice, Priority, Spawn, Tween,
+};
 
 /// The most commands one block applies, so a flood of them cannot starve the
 /// output; the rest wait for the next block.
@@ -24,6 +26,31 @@ pub(crate) const NO_SECTION: usize = usize::MAX;
 /// chunk and the headless drain without allocating on the audio thread.
 const SCRATCH_FRAMES: usize = 1024;
 
+/// The engine's declick for a stolen voice; a resampled voice whose slot was
+/// stolen fades over the same time.
+const DECLICK_MS: f32 = 5.0;
+
+/// Load the silent looping patch a resampled voice holds its engine slot
+/// with. Both the game side's engine and the mixer's load it first, so it
+/// has the same id in each.
+pub(crate) fn load_slot(engine: &mut Engine) -> PatchId {
+    let mut doc = SoundDoc::new("bevy_tono-slot", Node::Mix { inputs: Vec::new() });
+    doc.duration = 0.01;
+    doc.sample_rate = engine.sample_rate();
+    engine.load(&doc)
+}
+
+/// A resampled or filtered voice as the game side builds it.
+pub(crate) struct Sampled {
+    /// The sound's render, interleaved stereo at the device rate.
+    pub(crate) frames: Arc<[f32]>,
+    pub(crate) gain: f32,
+    pub(crate) pan: f32,
+    pub(crate) rate: f32,
+    pub(crate) lowpass_hz: Option<f32>,
+    pub(crate) looping: bool,
+}
+
 /// One change for the mixer, built (and rendered) on the sending thread.
 pub(crate) enum Command {
     Load(Box<SoundDoc>),
@@ -32,6 +59,13 @@ pub(crate) enum Command {
         prepared: PreparedVoice,
         how: Spawn,
         gain: f32,
+        pan: f32,
+    },
+    PlaySampled {
+        voice: u64,
+        sampled: Sampled,
+        slot: PreparedVoice,
+        priority: Priority,
     },
     Stop(u64),
     Gain(u64, f32),
@@ -102,6 +136,8 @@ pub(crate) struct Mixer {
     instruments: Vec<Instrument>,
     /// The engine instance behind each live `Voice` id.
     voices: Vec<(u64, InstanceHandle)>,
+    /// Voices the sample player mixes (a rate or a lowpass).
+    pub(crate) sampled: Vec<SampledVoice>,
     scratch: Vec<f32>,
     master_gain: f32,
     /// The newest reset applied, published with the position it produced.
@@ -111,14 +147,17 @@ pub(crate) struct Mixer {
 
 impl Mixer {
     pub(crate) fn new(sample_rate: u32, commands: Receiver<Command>, state: Arc<State>) -> Self {
+        let mut engine = Engine::new(sample_rate);
+        load_slot(&mut engine);
         Mixer {
             commands,
             state,
             sample_rate,
-            engine: Engine::new(sample_rate),
+            engine,
             music: AdaptiveMusic::new(sample_rate),
             instruments: Vec::with_capacity(8),
             voices: Vec::with_capacity(64),
+            sampled: Vec::with_capacity(64),
             scratch: vec![0.0; SCRATCH_FRAMES * 2],
             master_gain: 1.0,
             reset_seen: 0,
@@ -135,6 +174,7 @@ impl Mixer {
         self.apply_commands();
         let len = out.len();
         self.engine.fill(out); // SFX / one-shots (writes the whole buffer)
+        self.mix_sampled(out);
         if self.scratch.len() < len {
             self.scratch.resize(len, 0.0);
         }
@@ -179,23 +219,49 @@ impl Mixer {
                 prepared,
                 how,
                 gain,
+                pan,
             } => {
                 let h = self.engine.spawn_prepared(prepared, how);
                 if gain != 1.0 {
                     self.engine.set_gain(h, gain, Tween::IMMEDIATE);
                 }
+                if pan != 0.0 {
+                    self.engine.set_pan(h, pan, Tween::IMMEDIATE);
+                }
                 if self.engine.is_active(h) {
                     self.voices.push((voice, h));
+                }
+            }
+            Command::PlaySampled {
+                voice,
+                sampled,
+                slot,
+                priority,
+            } => {
+                // The engine decides whether the voice may sound, and what it
+                // steals, exactly as for its own voices.
+                let how = Spawn {
+                    looping: true,
+                    priority,
+                };
+                let slot = self.engine.spawn_prepared(slot, how);
+                if self.engine.is_active(slot) {
+                    self.sampled
+                        .push(SampledVoice::new(voice, slot, sampled, sr));
                 }
             }
             Command::Stop(voice) => {
                 if let Some(h) = self.handle(voice) {
                     self.engine.stop(h, Tween::ms(8.0, sr));
+                } else if let Some(v) = self.sampled_mut(voice) {
+                    v.stop(ms_frames(8.0, sr));
                 }
             }
             Command::Gain(voice, gain) => {
                 if let Some(h) = self.handle(voice) {
                     self.engine.set_gain(h, gain, Tween::ms(20.0, sr));
+                } else if let Some(v) = self.sampled_mut(voice) {
+                    v.gain.to(gain.max(0.0), ms_frames(20.0, sr));
                 }
             }
             Command::Layer(stem, fade_in_at) => {
@@ -237,6 +303,27 @@ impl Mixer {
         }
     }
 
+    fn sampled_mut(&mut self, voice: u64) -> Option<&mut SampledVoice> {
+        self.sampled.iter_mut().find(|v| v.id == voice)
+    }
+
+    /// Add the sample player's voices to `out`. A voice whose engine slot was
+    /// stolen or culled fades out; a finished voice gives its slot back.
+    fn mix_sampled(&mut self, out: &mut [f32]) {
+        let declick = ms_frames(DECLICK_MS, self.sample_rate);
+        let engine = &mut self.engine;
+        self.sampled.retain_mut(|v| {
+            if !v.stopping && !engine.is_active(v.slot) {
+                v.stop(declick);
+            }
+            let sounding = v.mix_into(out);
+            if !sounding {
+                engine.stop(v.slot, Tween::IMMEDIATE);
+            }
+            sounding
+        });
+    }
+
     fn handle(&self, voice: u64) -> Option<InstanceHandle> {
         self.voices
             .iter()
@@ -257,5 +344,153 @@ impl Mixer {
             self.published_section = section;
             state.current_section.store(section, Ordering::Release);
         }
+    }
+}
+
+/// A linear per-frame ramp, as the engine's faders move.
+#[derive(Clone, Copy)]
+pub(crate) struct Ramp {
+    value: f32,
+    target: f32,
+    step: f32,
+    remaining: u32,
+}
+
+impl Ramp {
+    pub(crate) fn new(value: f32) -> Self {
+        Ramp {
+            value,
+            target: value,
+            step: 0.0,
+            remaining: 0,
+        }
+    }
+
+    /// Head for `target` over `frames` (0 jumps there).
+    pub(crate) fn to(&mut self, target: f32, frames: u32) {
+        self.target = target;
+        if frames == 0 {
+            self.value = target;
+            self.remaining = 0;
+        } else {
+            self.step = (target - self.value) / frames as f32;
+            self.remaining = frames;
+        }
+    }
+
+    /// Advance one frame and return the value.
+    pub(crate) fn tick(&mut self) -> f32 {
+        if self.remaining > 0 {
+            self.value += self.step;
+            self.remaining -= 1;
+            if self.remaining == 0 {
+                self.value = self.target;
+            }
+        }
+        self.value
+    }
+
+    pub(crate) fn at_target(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
+/// `ms` milliseconds in frames, rounded as [`Tween::ms`] rounds.
+pub(crate) fn ms_frames(ms: f32, sample_rate: u32) -> u32 {
+    (ms / 1000.0 * sample_rate as f32).round().max(0.0) as u32
+}
+
+/// The engine's balance law: unity at centre, the far side attenuated.
+pub(crate) fn balance(pan: f32) -> (f32, f32) {
+    let l = if pan <= 0.0 { 1.0 } else { 1.0 - pan };
+    let r = if pan >= 0.0 { 1.0 } else { 1.0 + pan };
+    (l, r)
+}
+
+/// One voice of the sample player: a resampling read head over a sound's
+/// render, an optional one-pole lowpass, and the engine-style faders.
+pub(crate) struct SampledVoice {
+    id: u64,
+    /// The silent engine voice that holds this voice's place under the cap.
+    slot: InstanceHandle,
+    frames: Arc<[f32]>,
+    /// Read head, in frames.
+    pos: f64,
+    step: f64,
+    looping: bool,
+    /// One-pole coefficient (1.0 = no filter) and its per-channel state.
+    coeff: f32,
+    tone: [f32; 2],
+    gain: Ramp,
+    pan: Ramp,
+    stopping: bool,
+}
+
+impl SampledVoice {
+    fn new(id: u64, slot: InstanceHandle, sampled: Sampled, sample_rate: u32) -> Self {
+        let coeff = sampled.lowpass_hz.map_or(1.0, |hz| {
+            1.0 - (-std::f32::consts::TAU * hz / sample_rate as f32).exp()
+        });
+        SampledVoice {
+            id,
+            slot,
+            frames: sampled.frames,
+            pos: 0.0,
+            step: sampled.rate as f64,
+            looping: sampled.looping,
+            coeff,
+            tone: [0.0; 2],
+            gain: Ramp::new(sampled.gain),
+            pan: Ramp::new(sampled.pan),
+            stopping: false,
+        }
+    }
+
+    fn stop(&mut self, frames: u32) {
+        // Like the engine: a stop never cuts.
+        self.gain.to(0.0, frames.max(1));
+        self.stopping = true;
+    }
+
+    /// Add this voice to `out`; false once it has nothing more to play.
+    fn mix_into(&mut self, out: &mut [f32]) -> bool {
+        let n = self.frames.len() / 2;
+        if n == 0 {
+            return false;
+        }
+        for frame in out.as_chunks_mut::<2>().0 {
+            if self.pos >= n as f64 {
+                if !self.looping {
+                    return false;
+                }
+                self.pos %= n as f64;
+            }
+            let i = self.pos as usize;
+            let next = if i + 1 < n {
+                i + 1
+            } else if self.looping {
+                0
+            } else {
+                i
+            };
+            let t = (self.pos - i as f64) as f32;
+            let mut lr = [0.0f32; 2];
+            for (c, v) in lr.iter_mut().enumerate() {
+                let (a, b) = (self.frames[i * 2 + c], self.frames[next * 2 + c]);
+                let x = a + (b - a) * t;
+                *v = if self.coeff < 1.0 {
+                    self.tone[c] += (x - self.tone[c]) * self.coeff;
+                    self.tone[c]
+                } else {
+                    x
+                };
+            }
+            let g = self.gain.tick();
+            let (lg, rg) = balance(self.pan.tick());
+            frame[0] += lr[0] * g * lg;
+            frame[1] += lr[1] * g * rg;
+            self.pos += self.step;
+        }
+        !(self.stopping && self.gain.at_target())
     }
 }
