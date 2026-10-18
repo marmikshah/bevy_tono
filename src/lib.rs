@@ -89,7 +89,7 @@ pub mod review {
         // rate → NaN/garbage. Grade at a sane rate rather than trust the field.
         let doc = if doc.sample_rate == 0 {
             let mut d = doc.clone();
-            d.sample_rate = 48_000;
+            d.sample_rate = super::FALLBACK_SAMPLE_RATE;
             std::borrow::Cow::Owned(d)
         } else {
             std::borrow::Cow::Borrowed(doc)
@@ -149,6 +149,10 @@ pub struct TonoAudio {
     voices: Arc<Mutex<HashMap<PatchId, PreparedVoice>>>,
     sample_rate: u32,
 }
+
+/// The rate used when there is none to go by: no audio device, or a doc whose
+/// `sample_rate` is 0.
+const FALLBACK_SAMPLE_RATE: u32 = 48_000;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -400,32 +404,31 @@ impl TonoAudio {
     /// Start a note on a registered instrument (velocity 0..1). Polyphonic —
     /// hold several at once.
     pub fn note_on(&self, instrument: InstrumentId, note: Note, velocity: f32) {
-        let mut bus = lock(&self.bus);
-        if let Some(inst) = bus.instruments.get_mut(instrument.0) {
+        self.with_instrument(instrument, "note_on", |inst| {
             inst.note_on(note, velocity);
-        } else {
-            debug_assert!(false, "note_on: unknown instrument {}", instrument.0);
-        }
+        });
     }
 
     /// Release a note on a registered instrument.
     pub fn note_off(&self, instrument: InstrumentId, note: Note) {
-        let mut bus = lock(&self.bus);
-        if let Some(inst) = bus.instruments.get_mut(instrument.0) {
+        self.with_instrument(instrument, "note_off", |inst| {
             inst.note_off(note);
-        } else {
-            debug_assert!(false, "note_off: unknown instrument {}", instrument.0);
-        }
+        });
     }
 
     /// Set the pitch bend, in semitones, on a registered instrument (a whammy /
     /// bend-wheel knob; applies to its sounding voices).
     pub fn set_bend(&self, instrument: InstrumentId, semitones: f32) {
+        self.with_instrument(instrument, "set_bend", |inst| inst.set_bend(semitones));
+    }
+
+    /// Run `f` on a registered instrument. An unknown id is a caller bug.
+    fn with_instrument(&self, instrument: InstrumentId, op: &str, f: impl FnOnce(&mut Instrument)) {
         let mut bus = lock(&self.bus);
         if let Some(inst) = bus.instruments.get_mut(instrument.0) {
-            inst.set_bend(semitones);
+            f(inst);
         } else {
-            debug_assert!(false, "set_bend: unknown instrument {}", instrument.0);
+            debug_assert!(false, "{op}: unknown instrument {}", instrument.0);
         }
     }
 
@@ -599,7 +602,10 @@ impl AudioSource for GameBus {
 /// return a shared handle to the bus. Never fails — a missing device degrades to
 /// a silent (undrained) bus.
 fn spawn_audio() -> (Arc<Mutex<GameBus>>, u32) {
-    let fallback = || (Arc::new(Mutex::new(GameBus::new(48_000))), 48_000u32);
+    let fallback = || {
+        let bus = Arc::new(Mutex::new(GameBus::new(FALLBACK_SAMPLE_RATE)));
+        (bus, FALLBACK_SAMPLE_RATE)
+    };
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("bevy_tono-audio".into())
@@ -613,8 +619,7 @@ fn spawn_audio() -> (Arc<Mutex<GameBus>>, u32) {
             }
             Err(e) => {
                 eprintln!("bevy_tono: audio disabled ({e})");
-                tx.send((Arc::new(Mutex::new(GameBus::new(48_000))), 48_000))
-                    .ok();
+                tx.send(fallback()).ok();
             }
         });
     if spawned.is_err() {
