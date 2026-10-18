@@ -472,6 +472,16 @@ impl TonoAudio {
         Some(voice)
     }
 
+    /// Cap the voices sounding at once (SFX and beds; music and instruments
+    /// are not counted). The engine's own mechanism: once full, a new voice
+    /// steals the sounding voice of lowest [`Priority`] — the oldest on a tie
+    /// — when that is not above its own, and is dropped otherwise. A stolen
+    /// voice fades out over a few milliseconds. Unlimited until called; 0
+    /// is treated as 1.
+    pub fn set_max_voices(&self, max: usize) {
+        self.send(Command::MaxVoices(max));
+    }
+
     /// Stop a voice (a short fade avoids a click).
     pub fn stop(&self, voice: Voice) {
         self.send(Command::Stop(voice.0));

@@ -748,3 +748,62 @@ fn variation_stays_in_its_ranges() {
         assert!((0.9..=1.0).contains(&p.gain), "{p:?}");
     }
 }
+
+#[test]
+fn the_voice_cap_is_respected_by_both_kinds_of_voice() {
+    let (audio, mut mixer) = manual();
+    let sound = audio.register(&long_phrase());
+    audio.set_max_voices(3);
+    let resampled = Play {
+        rate: 1.5,
+        ..Play::default()
+    };
+    let low = Play {
+        priority: Priority::LOW,
+        ..Play::default()
+    };
+    audio.play_with(sound, low);
+    audio.play_with(sound, resampled);
+    audio.play_with(
+        sound,
+        Play {
+            priority: Priority::LOW,
+            ..resampled
+        },
+    );
+    pull(&mut mixer, 64);
+    assert_eq!(mixer.engine.active(), 3);
+
+    // Full: a normal voice steals the oldest low-priority one.
+    audio.play(sound);
+    pull(&mut mixer, 1_000);
+    assert_eq!(mixer.engine.active(), 3, "the cap holds");
+    assert_eq!(mixer.sampled.len(), 2, "an engine voice was stolen first");
+
+    // Then a resampled normal voice steals the remaining low one.
+    audio.play_with(sound, resampled);
+    pull(&mut mixer, 1_000);
+    assert_eq!(mixer.engine.active(), 3);
+    assert_eq!(mixer.sampled.len(), 2, "the low resampled voice faded out");
+
+    // Everything left is normal: a low voice is dropped.
+    let dropped = audio.play_with(sound, low);
+    pull(&mut mixer, 1_000);
+    assert_eq!(mixer.engine.active(), 3, "the cap holds");
+    assert!(
+        mixer.handle(dropped.0).is_none(),
+        "the low voice never sounded"
+    );
+
+    // A high voice always gets in.
+    audio.play_with(
+        sound,
+        Play {
+            priority: Priority::HIGH,
+            ..resampled
+        },
+    );
+    pull(&mut mixer, 1_000);
+    assert_eq!(mixer.engine.active(), 3);
+    assert_eq!(mixer.sampled.len(), 2, "one of the earlier ones made way");
+}
