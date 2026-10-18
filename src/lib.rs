@@ -492,6 +492,23 @@ impl TonoAudio {
         self.send(Command::Gain(voice.0, gain));
     }
 
+    /// Set a voice's left and right levels, slewing linearly over `ramp` —
+    /// for a continuous, panned bed (wind that follows speed, a stream that
+    /// moves with the camera). Start the bed with
+    /// [`play_looping`](Self::play_looping) or a looping [`Play`] and call
+    /// this as often as the game likes.
+    ///
+    /// Beds are voices, not music: [`music_pause`](Self::music_pause) and
+    /// [`music_reset`](Self::music_reset) leave them playing. The levels map
+    /// onto the voice's gain (the louder side) and pan (the engine's balance
+    /// law), so a later [`set_gain`](Self::set_gain) scales both sides.
+    pub fn set_levels(&self, voice: Voice, levels: [f32; 2], ramp: std::time::Duration) {
+        let level = |x: f32| if x.is_nan() { 0.0 } else { x.max(0.0) };
+        let frames = (ramp.as_secs_f64() * self.inner.sample_rate as f64).round();
+        let levels = [level(levels[0]), level(levels[1])];
+        self.send(Command::Levels(voice.0, levels, frames as u32));
+    }
+
     /// Add a looping music stem that fades to full volume once
     /// [`set_intensity`](Self::set_intensity) reaches `fade_in_at` (0.0 = always
     /// playing). Layer several for reactive game music.

@@ -74,6 +74,8 @@ pub(crate) enum Command {
     Stop(u64),
     MaxVoices(usize),
     Gain(u64, f32),
+    /// Left/right levels and a ramp length in frames.
+    Levels(u64, [f32; 2], u32),
     Layer(LoopBuffer, f32),
     Intensity(f32),
     IntensityAt(f32, Quantize),
@@ -294,6 +296,16 @@ impl Mixer {
                     v.gain.to(gain.max(0.0), ms_frames(20.0, sr));
                 }
             }
+            Command::Levels(voice, [l, r], frames) => {
+                let (gain, pan) = gain_and_pan(l, r);
+                if let Some(h) = self.handle(voice) {
+                    self.engine.set_gain(h, gain, Tween::frames(frames));
+                    self.engine.set_pan(h, pan, Tween::frames(frames));
+                } else if let Some(v) = self.sampled_mut(voice) {
+                    v.gain.to(gain, frames);
+                    v.pan.to(pan, frames);
+                }
+            }
             Command::Layer(stem, fade_in_at) => {
                 self.music.add_layer(stem, fade_in_at);
             }
@@ -436,6 +448,19 @@ pub(crate) fn balance(pan: f32) -> (f32, f32) {
     let l = if pan <= 0.0 { 1.0 } else { 1.0 - pan };
     let r = if pan >= 0.0 { 1.0 } else { 1.0 + pan };
     (l, r)
+}
+
+/// The gain and balance-law pan that put `l` and `r` on the two sides.
+pub(crate) fn gain_and_pan(l: f32, r: f32) -> (f32, f32) {
+    let gain = l.max(r);
+    let pan = if gain <= 0.0 {
+        0.0
+    } else if l >= r {
+        r / l - 1.0
+    } else {
+        1.0 - l / r
+    };
+    (gain, pan)
 }
 
 /// One voice of the sample player: a resampling read head over a sound's
