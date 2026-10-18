@@ -317,6 +317,28 @@ impl TonoAudio {
         sound
     }
 
+    /// Render `sound` on a background thread, so its first play costs the
+    /// game thread nothing. Renders what a plain play needs, plus the sample
+    /// buffer a resampled play needs when the sound carries a
+    /// [`Variation`]. A play that arrives before the render finishes renders
+    /// it itself, as without a prewarm.
+    pub fn prewarm(&self, sound: Sound) {
+        let audio = self.clone();
+        // With no thread to spare, the first play renders, as before.
+        std::thread::Builder::new()
+            .name("bevy_tono-prewarm".into())
+            .spawn(move || {
+                audio.rendered_voice(sound);
+                let varied = lock(&audio.inner.registry)
+                    .variations
+                    .contains_key(&sound.0);
+                if varied {
+                    audio.samples(sound);
+                }
+            })
+            .ok();
+    }
+
     /// The next variation offset, uniform in −1..1.
     fn draw(&self) -> f32 {
         let step = |mut x: u32| {
