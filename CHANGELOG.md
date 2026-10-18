@@ -5,6 +5,48 @@ format loosely [Keep a Changelog](https://keepachangelog.com). Entries begin
 from the point this file was added — earlier releases live in the crates.io
 version history and the git log.
 
+## Unreleased
+
+### Added
+- **`play_with(sound, Play)`**: per-play `gain`, `pan`, `rate`, `lowpass_hz`,
+  `priority` and `looping`, plus matching `PlaySfx` builders (`with_pan`,
+  `with_rate`, `with_lowpass`, `with_priority`, `looping`). Rate is a
+  linear-interpolation resample of the rendered sound; at rate 1.0 with no
+  lowpass the voice is bit-identical to `play`. Pan uses the engine's
+  balance law.
+- **`register_with(doc, Variation { pitch, pan, level })`**: each play draws a
+  small offset from a seeded generator, so repeats vary the same way every
+  run.
+- **`set_max_voices(n)`** and the re-exported `Priority`: the engine's voice
+  cap and stealing, applied to every voice, resampled ones included.
+- **`set_music_gain(gain, ramp)`**: a ramped music-bus gain, separate from the
+  duck and intensity.
+- **`TonoConfig`**, read when the plugin starts: an optional output `Limiter`
+  and `pause_music_on_focus_loss`. Both off by default.
+- **`set_levels(voice, [left, right], ramp)`**: slewed, panned levels for a
+  looping bed. Beds play through `music_pause` and `music_reset`.
+- **`prewarm(sound)`**: render a sound on a background thread.
+- **`transition_to_section_with(section, quantize, SectionEntry)`**: resume a
+  section where it left off, and/or count `Beat`/`Bar`/`Bars(n)` from the
+  sounding section's entry.
+- i16 and u16 output devices.
+
+### Changed
+- The audio callback owns the mixer; `TonoAudio` talks to it through a
+  lock-free command queue and reads state back from atomics, so a game-thread
+  call can no longer cost the callback a buffer. The rest of the public API
+  is unchanged, and so is its output (a test compares it with the 0.6 bus
+  sample for sample).
+- With no output device the mixer drains in real time, so the music clock,
+  beats and quantized changes keep working headless.
+- `set_master_gain` ramps over 10 ms instead of stepping.
+- `PlaySfx` has more public fields; build it with `PlaySfx::new` (a struct
+  literal with only `sound` and `gain` no longer compiles).
+- Sections play through bevy_tono's own section player (the bed's first
+  layer); with the default entry they sound exactly as before.
+- The lib takes bevy's `bevy_window` feature, for the focus and lifecycle
+  messages.
+
 ## 0.6.0 — 2026-10-18
 
 Still requires tono-core 1.12. No public API changes.
