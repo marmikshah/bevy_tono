@@ -36,7 +36,7 @@ fn peak(out: &[f32]) -> f32 {
 
 /// A resource and its mixer with no device or thread: the test pulls blocks.
 fn manual() -> (TonoAudio, Mixer) {
-    TonoAudio::with_mixer(48_000)
+    TonoAudio::with_mixer(48_000, &TonoConfig::default())
 }
 
 /// The plugin's messages and systems over a manual mixer.
@@ -178,9 +178,6 @@ fn the_mixer_matches_the_old_bus_sample_for_sample() {
     audio.music_reset();
     old.music.reset();
     compare(&mut mixer, &mut old, 20);
-    audio.set_master_gain(0.5);
-    old.master_gain = 0.5;
-    compare(&mut mixer, &mut old, 5);
 }
 
 #[test]
@@ -192,16 +189,61 @@ fn bus_plays_a_registered_sfx() {
 }
 
 #[test]
-fn master_gain_silences() {
+fn master_gain_ramps_instead_of_stepping() {
     let (audio, mut mixer) = manual();
-    let sound = audio.register(&blip());
+    audio.music_layer(&pad(), 0.0);
+    let before = pull(&mut mixer, 512);
     audio.set_master_gain(0.0);
+    let ramp = pull(&mut mixer, 480); // 10 ms
+    assert!(peak(&ramp[..96]) > 0.0, "it does not drop at once");
+    for (f, pair) in ramp.as_chunks::<2>().0.iter().enumerate().skip(1) {
+        let jump = (pair[0] - ramp[(f - 1) * 2]).abs();
+        assert!(jump < 0.1, "no step at frame {f}: {jump}");
+    }
+    assert!(peak(&before) > 0.1);
+    assert_eq!(peak(&pull(&mut mixer, 512)), 0.0, "then the bus is silent");
+}
+
+#[test]
+fn music_gain_ramps_the_music_only() {
+    let (audio, mut mixer) = manual();
+    audio.music_layer(&pad(), 0.0);
+    audio.set_music_gain(0.0, std::time::Duration::from_millis(50));
+    let fading = pull(&mut mixer, 2_400);
+    assert!(peak(&fading[..480]) > 0.05, "it ramps");
+    assert_eq!(peak(&pull(&mut mixer, 512)), 0.0, "the music is down");
+    let sound = audio.register(&blip());
     audio.play(sound);
-    assert_eq!(
-        peak(&pull(&mut mixer, 512)),
-        0.0,
-        "master gain 0 mutes the bus"
+    assert!(peak(&pull(&mut mixer, 512)) > 0.1, "SFX are not music");
+    audio.set_music_gain(1.0, std::time::Duration::ZERO);
+    audio.music_duck(0.5, std::time::Duration::from_millis(100));
+    pull(&mut mixer, 6_000);
+    assert!(
+        peak(&pull(&mut mixer, 512)) > 0.05,
+        "back up, the duck on top"
     );
+}
+
+#[test]
+fn the_limiter_holds_its_ceiling_and_is_off_by_default() {
+    let loud = |config: &TonoConfig| {
+        let (audio, mut mixer) = TonoAudio::with_mixer(48_000, config);
+        let sound = audio.register(&pad());
+        for _ in 0..4 {
+            audio.play_with_gain(sound, 3.0);
+        }
+        pull(&mut mixer, 12_000)
+    };
+    let raw = loud(&TonoConfig::default());
+    assert_eq!(peak(&raw), 1.0, "unlimited, it hits the clamp");
+    let limited = loud(&TonoConfig {
+        limiter: Some(Limiter {
+            ceiling: 0.8,
+            release: std::time::Duration::from_millis(50),
+        }),
+    });
+    assert!(peak(&limited) <= 0.8 + 1e-6, "{}", peak(&limited));
+    assert!(peak(&limited) > 0.7);
 }
 
 #[test]

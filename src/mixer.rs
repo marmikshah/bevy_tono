@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+use crate::{Limiter, TonoConfig};
 use tono_core::adaptive::{AdaptiveMusic, LoopBuffer, Quantize, Stinger};
 use tono_core::dsl::{Node, SoundDoc};
 use tono_core::instrument::{Instrument, Note};
@@ -29,6 +30,9 @@ const SCRATCH_FRAMES: usize = 1024;
 /// The engine's declick for a stolen voice; a resampled voice whose slot was
 /// stolen fades over the same time.
 const DECLICK_MS: f32 = 5.0;
+
+/// How long a master gain change ramps.
+const MASTER_RAMP_MS: f32 = 10.0;
 
 /// Load the silent looping patch a resampled voice holds its engine slot
 /// with. Both the game side's engine and the mixer's load it first, so it
@@ -86,6 +90,8 @@ pub(crate) enum Command {
     NoteOff(usize, Note),
     Bend(usize, f32),
     MasterGain(f32),
+    /// A target and a ramp length in frames.
+    MusicGain(f32, u32),
 }
 
 /// What the game reads back without reaching the mixer. The mixer stores
@@ -140,14 +146,21 @@ pub(crate) struct Mixer {
     /// Voices the sample player mixes (a rate or a lowpass).
     pub(crate) sampled: Vec<SampledVoice>,
     scratch: Vec<f32>,
-    master_gain: f32,
+    master_gain: Ramp,
+    music_gain: Ramp,
+    limiter: Option<LimiterState>,
     /// The newest reset applied, published with the position it produced.
     reset_seen: u64,
     published_section: usize,
 }
 
 impl Mixer {
-    pub(crate) fn new(sample_rate: u32, commands: Receiver<Command>, state: Arc<State>) -> Self {
+    pub(crate) fn new(
+        sample_rate: u32,
+        commands: Receiver<Command>,
+        state: Arc<State>,
+        config: &TonoConfig,
+    ) -> Self {
         let mut engine = Engine::new(sample_rate);
         load_slot(&mut engine);
         Mixer {
@@ -160,7 +173,9 @@ impl Mixer {
             voices: Vec::with_capacity(64),
             sampled: Vec::with_capacity(64),
             scratch: vec![0.0; SCRATCH_FRAMES * 2],
-            master_gain: 1.0,
+            master_gain: Ramp::new(1.0),
+            music_gain: Ramp::new(1.0),
+            limiter: config.limiter.map(|l| LimiterState::new(l, sample_rate)),
             reset_seen: 0,
             published_section: NO_SECTION,
         }
@@ -181,8 +196,15 @@ impl Mixer {
         }
         // Add the music bed, then each live instrument, through the scratch.
         self.music.fill(&mut self.scratch[..len]);
-        for (o, &s) in out.iter_mut().zip(&self.scratch[..len]) {
-            *o += s;
+        for (o, s) in out
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(self.scratch[..len].as_chunks::<2>().0)
+        {
+            let g = self.music_gain.tick();
+            o[0] += s[0] * g;
+            o[1] += s[1] * g;
         }
         for inst in &mut self.instruments {
             inst.fill(&mut self.scratch[..len]);
@@ -190,10 +212,16 @@ impl Mixer {
                 *o += s;
             }
         }
-        // Master gain + clamp.
-        let g = self.master_gain;
-        for o in out.iter_mut() {
-            *o = (*o * g).clamp(-1.0, 1.0);
+        // Master gain, the optional limiter, then the clamp.
+        for o in out.as_chunks_mut::<2>().0 {
+            let g = self.master_gain.tick();
+            let (mut l, mut r) = (o[0] * g, o[1] * g);
+            if let Some(limiter) = &mut self.limiter {
+                let g = limiter.gain(l, r);
+                (l, r) = (l * g, r * g);
+            }
+            o[0] = l.clamp(-1.0, 1.0);
+            o[1] = r.clamp(-1.0, 1.0);
         }
         let engine = &self.engine;
         self.voices.retain(|&(_, h)| engine.is_active(h));
@@ -301,7 +329,8 @@ impl Mixer {
                     inst.set_bend(semitones);
                 }
             }
-            Command::MasterGain(gain) => self.master_gain = gain,
+            Command::MasterGain(gain) => self.master_gain.to(gain, ms_frames(MASTER_RAMP_MS, sr)),
+            Command::MusicGain(gain, frames) => self.music_gain.to(gain, frames),
         }
     }
 
@@ -494,5 +523,40 @@ impl SampledVoice {
             self.pos += self.step;
         }
         !(self.stopping && self.gain.at_target())
+    }
+}
+
+/// The output limiter's running gain.
+struct LimiterState {
+    ceiling: f32,
+    /// Per-frame one-pole release coefficient.
+    release: f32,
+    gain: f32,
+}
+
+impl LimiterState {
+    fn new(limiter: Limiter, sample_rate: u32) -> Self {
+        let frames = (limiter.release.as_secs_f32() * sample_rate as f32).max(1.0);
+        LimiterState {
+            ceiling: limiter.ceiling.clamp(0.0, 1.0),
+            release: 1.0 - (-1.0 / frames).exp(),
+            gain: 1.0,
+        }
+    }
+
+    /// The gain for this frame: instant attack, smooth release.
+    fn gain(&mut self, l: f32, r: f32) -> f32 {
+        let peak = l.abs().max(r.abs());
+        let wanted = if peak > self.ceiling {
+            self.ceiling / peak
+        } else {
+            1.0
+        };
+        self.gain = if wanted < self.gain {
+            wanted
+        } else {
+            self.gain + (wanted - self.gain) * self.release
+        };
+        self.gain
     }
 }
