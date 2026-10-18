@@ -257,10 +257,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl TonoAudio {
     /// A resource and the mixer it drives, joined by a fresh command queue.
-    fn with_mixer(sample_rate: u32) -> (TonoAudio, Mixer) {
+    fn with_mixer(sample_rate: u32, config: &TonoConfig) -> (TonoAudio, Mixer) {
         let (tx, rx) = mpsc::channel();
         let state = Arc::new(State::default());
-        let mixer = Mixer::new(sample_rate, rx, state.clone());
+        let mixer = Mixer::new(sample_rate, rx, state.clone(), config);
         let mut engine = Engine::new(sample_rate);
         let slot_patch = mixer::load_slot(&mut engine);
         let mut slot = engine.prepare(slot_patch).expect("just loaded");
@@ -723,10 +723,21 @@ impl TonoAudio {
     }
 
     /// Set the master output gain applied to the whole bus (SFX + music),
-    /// `0.0..=1.0` — a global volume knob. Clamped; applied per sample, so a
-    /// change is click-free at the buffer scale.
+    /// `0.0..=1.0` — a global volume knob. Clamped, and ramped over 10 ms so
+    /// a change never steps.
     pub fn set_master_gain(&self, gain: f32) {
+        let gain = if gain.is_nan() { 0.0 } else { gain };
         self.send(Command::MasterGain(gain.clamp(0.0, 1.0)));
+    }
+
+    /// Set the music bus gain (the bed, its sections and stingers),
+    /// `0.0..=1.0`, ramped linearly over `ramp`. Separate from
+    /// [`music_duck`](Self::music_duck) and the intensity cross-fade, which
+    /// keep working underneath it — a settings slider or a scene fade.
+    pub fn set_music_gain(&self, gain: f32, ramp: std::time::Duration) {
+        let gain = if gain.is_nan() { 0.0 } else { gain };
+        let frames = (ramp.as_secs_f64() * self.inner.sample_rate as f64).round();
+        self.send(Command::MusicGain(gain.clamp(0.0, 1.0), frames as u32));
     }
 
     /// The device sample rate the engine renders at.
@@ -884,6 +895,47 @@ fn drain_notes(
     }
 }
 
+/// Options [`TonoPlugin`] reads when it starts. Insert it before adding the
+/// plugin; without one, every option is off and the output is as before.
+///
+/// ```no_run
+/// # use bevy::prelude::*;
+/// use bevy_tono::{Limiter, TonoConfig, TonoPlugin};
+///
+/// App::new()
+///     .insert_resource(TonoConfig {
+///         limiter: Some(Limiter::default()),
+///         ..TonoConfig::default()
+///     })
+///     .add_plugins(TonoPlugin);
+/// ```
+#[derive(Resource, Clone, Debug, Default)]
+pub struct TonoConfig {
+    /// A peak limiter on the final mix, so coincident loud cues bend under a
+    /// ceiling instead of clipping. Off by default.
+    pub limiter: Option<Limiter>,
+}
+
+/// A stereo-linked peak limiter on the output: it pulls the gain down at
+/// once when a frame would pass `ceiling`, then recovers over `release`. Both
+/// channels share one gain, so the stereo image does not shift.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Limiter {
+    /// The highest sample magnitude let through (linear, e.g. 0.95).
+    pub ceiling: f32,
+    /// How long the gain takes to recover (a one-pole time constant).
+    pub release: std::time::Duration,
+}
+
+impl Default for Limiter {
+    fn default() -> Self {
+        Limiter {
+            ceiling: 0.95,
+            release: std::time::Duration::from_millis(100),
+        }
+    }
+}
+
 /// The plugin: sets up real-time audio, inserts [`TonoAudio`], and wires the
 /// [`PlaySfx`] / [`PlayNote`] / [`StopNote`] messages so systems can make sound
 /// without touching the resource.
@@ -891,7 +943,12 @@ pub struct TonoPlugin;
 
 impl Plugin for TonoPlugin {
     fn build(&self, app: &mut App) {
-        install(app, output::spawn_audio());
+        let config = app
+            .world()
+            .get_resource::<TonoConfig>()
+            .cloned()
+            .unwrap_or_default();
+        install(app, output::spawn_audio(&config));
     }
 }
 

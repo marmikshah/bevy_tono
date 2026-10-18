@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::mixer::Mixer;
-use crate::{FALLBACK_SAMPLE_RATE, TonoAudio};
+use crate::{FALLBACK_SAMPLE_RATE, TonoAudio, TonoConfig};
 
 /// Frames the callback mixes per pass. The scratch is fixed at this size, so
 /// any device buffer is served in chunks without allocating.
@@ -19,13 +19,14 @@ const DRAIN_TICK: Duration = Duration::from_millis(10);
 /// Spawn the audio thread and return the resource that talks to its mixer.
 /// Never fails: a missing device, or a format it cannot open, degrades to a
 /// silent drain at [`FALLBACK_SAMPLE_RATE`].
-pub(crate) fn spawn_audio() -> TonoAudio {
+pub(crate) fn spawn_audio(config: &TonoConfig) -> TonoAudio {
     let (ready, result) = std::sync::mpsc::sync_channel(1);
+    let thread_config = config.clone();
     let spawned = std::thread::Builder::new()
         .name("bevy_tono-audio".into())
         .spawn(move || {
             // The stream stays on the thread that built it: some hosts need that.
-            match open_stream() {
+            match open_stream(&thread_config) {
                 Ok((stream, audio)) => {
                     ready.send(audio).ok();
                     let _stream = stream;
@@ -35,11 +36,11 @@ pub(crate) fn spawn_audio() -> TonoAudio {
                 }
                 Err(e) => eprintln!("bevy_tono: audio disabled ({e})"),
             }
-            let (audio, mixer) = TonoAudio::with_mixer(FALLBACK_SAMPLE_RATE);
+            let (audio, mixer) = TonoAudio::with_mixer(FALLBACK_SAMPLE_RATE, &thread_config);
             ready.send(audio).ok();
             drain(mixer);
         });
-    let fallback = || TonoAudio::with_mixer(FALLBACK_SAMPLE_RATE).0;
+    let fallback = || TonoAudio::with_mixer(FALLBACK_SAMPLE_RATE, config).0;
     if spawned.is_err() {
         return fallback();
     }
@@ -48,14 +49,14 @@ pub(crate) fn spawn_audio() -> TonoAudio {
 
 /// Open the default output device and start a stream whose callback owns the
 /// mixer.
-fn open_stream() -> anyhow::Result<(cpal::Stream, TonoAudio)> {
+fn open_stream(config: &TonoConfig) -> anyhow::Result<(cpal::Stream, TonoAudio)> {
     let device = cpal::default_host()
         .default_output_device()
         .ok_or_else(|| anyhow::anyhow!("no default output device"))?;
     let supported = device.default_output_config()?;
     let format = supported.sample_format();
     let stream_config: cpal::StreamConfig = supported.into();
-    let (audio, mixer) = TonoAudio::with_mixer(stream_config.sample_rate.0);
+    let (audio, mixer) = TonoAudio::with_mixer(stream_config.sample_rate.0, config);
     let stream = match format {
         cpal::SampleFormat::F32 => build::<f32>(&device, &stream_config, mixer)?,
         cpal::SampleFormat::I16 => build::<i16>(&device, &stream_config, mixer)?,
