@@ -1,5 +1,5 @@
 #!/bin/sh
-# Canonical pre-push hook: refuse direct master pushes, then mirror CI.
+# Pre-push: refuse direct master pushes, then run what CI runs.
 # Installed by `make hooks` (git config core.hooksPath .githooks).
 # Bypass in an emergency with --no-verify.
 set -e

@@ -1,6 +1,4 @@
-# bevy_tono — canonical Makefile.
-# No shell scripts a human runs: every recipe calls real tools only. `make` is
-# the sole entrypoint; the git hooks call `make pre-commit-checks` / `make test`.
+# bevy_tono — `make` is the entry point; the git hooks and CI call these targets.
 
 .DEFAULT_GOAL := help
 .PHONY: help hooks run test pre-commit-checks clean
