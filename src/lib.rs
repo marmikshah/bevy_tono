@@ -39,12 +39,16 @@ use tono_core::dsl::SoundDoc;
 use tono_core::instrument::{Instrument, InstrumentDesign};
 use tono_core::runtime::{Engine, PatchId, PreparedVoice, Spawn, Transport};
 
+/// A voice's importance under [`TonoAudio::set_max_voices`], re-exported
+/// from the engine.
+pub use tono_core::runtime::Priority;
+
 mod mixer;
 mod output;
 #[cfg(test)]
 mod tests;
 
-use mixer::{Command, Mixer, NO_SECTION, State};
+use mixer::{Command, Mixer, NO_SECTION, Sampled, State};
 
 /// The engine, re-exported so a downstream game needs only `bevy_tono` as a
 /// dependency — author sounds with [`tono_core::dsl::SoundDoc`] without wiring
@@ -145,6 +149,42 @@ impl Voice {
     const INERT: Voice = Voice(0);
 }
 
+/// How one play of a [`Sound`] sounds — the argument to
+/// [`TonoAudio::play_with`]. `Play::default()` plays exactly as
+/// [`TonoAudio::play`] does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Play {
+    /// Starting gain (1.0 = unity), applied from the first sample.
+    pub gain: f32,
+    /// Stereo balance, −1 (left) to +1 (right). The engine's balance law:
+    /// the far side is attenuated and the near side stays at unity, so a
+    /// panned cue never gains level and still reads in mono.
+    pub pan: f32,
+    /// Playback rate (1.0 = as rendered). A resample of the rendered sound,
+    /// so pitch and length change together: 2.0 is an octave up at half the
+    /// length. Non-positive or non-finite plays at 1.0.
+    pub rate: f32,
+    /// A one-pole lowpass on this voice, at this cutoff in Hz. `None` = off.
+    pub lowpass_hz: Option<f32>,
+    /// Importance under [`TonoAudio::set_max_voices`].
+    pub priority: Priority,
+    /// Loop until stopped instead of playing once.
+    pub looping: bool,
+}
+
+impl Default for Play {
+    fn default() -> Self {
+        Play {
+            gain: 1.0,
+            pan: 0.0,
+            rate: 1.0,
+            lowpass_hz: None,
+            priority: Priority::NORMAL,
+            looping: false,
+        }
+    }
+}
+
 /// A live, polyphonic instrument you can play note-by-note (from a preset or an
 /// [`InstrumentDesign`]). Register one, then `note_on`/`note_off`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -166,6 +206,10 @@ struct Inner {
     registry: Mutex<Registry>,
     /// One rendered voice per played [`Sound`], so a replay renders nothing.
     voices: Mutex<HashMap<PatchId, PreparedVoice>>,
+    /// One rendered buffer per [`Sound`] played with a rate or a lowpass.
+    samples: Mutex<HashMap<PatchId, Arc<[f32]>>>,
+    /// The silent engine voice a resampled voice holds its place with.
+    slot: PreparedVoice,
     next_voice: AtomicU64,
     sample_rate: u32,
 }
@@ -175,6 +219,8 @@ struct Registry {
     /// Every loaded patch, in mixer order, so a voice can be prepared here
     /// and rendered off the audio thread. Never mixed.
     engine: Engine,
+    /// Each sound's doc at the device rate, to render its sample buffer.
+    docs: HashMap<PatchId, SoundDoc>,
     sections: Vec<String>,
     instruments: usize,
     tempo: (f32, u32),
@@ -194,17 +240,24 @@ impl TonoAudio {
         let (tx, rx) = mpsc::channel();
         let state = Arc::new(State::default());
         let mixer = Mixer::new(sample_rate, rx, state.clone());
+        let mut engine = Engine::new(sample_rate);
+        let slot_patch = mixer::load_slot(&mut engine);
+        let mut slot = engine.prepare(slot_patch).expect("just loaded");
+        slot.render();
         let audio = TonoAudio {
             inner: Arc::new(Inner {
                 commands: tx,
                 state,
                 registry: Mutex::new(Registry {
-                    engine: Engine::new(sample_rate),
+                    engine,
+                    docs: HashMap::new(),
                     sections: Vec::new(),
                     instruments: 0,
                     tempo: (0.0, 4),
                 }),
                 voices: Mutex::default(),
+                samples: Mutex::default(),
+                slot,
                 next_voice: AtomicU64::new(1),
                 sample_rate,
             }),
@@ -225,6 +278,7 @@ impl TonoAudio {
         // Load and send under one lock, so both engines number it the same.
         let mut registry = lock(&self.inner.registry);
         let patch = registry.engine.load(&d);
+        registry.docs.insert(patch, d.clone());
         self.send(Command::Load(Box::new(d)));
         Sound(patch)
     }
@@ -233,26 +287,85 @@ impl TonoAudio {
     /// gain); the engine reclaims it when it finishes. The first play of a
     /// sound renders it on the calling thread; later plays reuse that render.
     pub fn play(&self, sound: Sound) -> Voice {
-        self.spawn(sound, Spawn::default(), 1.0)
+        self.play_with(sound, Play::default())
     }
 
     /// Fire a one-shot that starts at `gain` (no 20 ms ramp from unity, so a
     /// short/transient SFX honours the level from its very first sample).
     pub fn play_with_gain(&self, sound: Sound, gain: f32) -> Voice {
-        self.spawn(sound, Spawn::default(), gain)
+        self.play_with(
+            sound,
+            Play {
+                gain,
+                ..Play::default()
+            },
+        )
     }
 
     /// Start a looping voice (e.g. an ambience bed).
     pub fn play_looping(&self, sound: Sound) -> Voice {
-        let looping = Spawn {
-            looping: true,
-            ..Spawn::default()
+        self.play_with(
+            sound,
+            Play {
+                looping: true,
+                ..Play::default()
+            },
+        )
+    }
+
+    /// Play a sound with per-play controls: gain, pan, rate, lowpass,
+    /// priority and looping (see [`Play`]).
+    ///
+    /// At rate 1.0 with no lowpass the engine plays the voice, exactly as
+    /// [`play`](Self::play) does. Otherwise a sample player resamples the
+    /// sound's render (linear interpolation) and filters it; that voice still
+    /// holds a silent engine voice, so [`set_max_voices`](Self::set_max_voices)
+    /// and [`Priority`] govern it like any other. The first such play of a
+    /// sound renders its buffer on the calling thread.
+    pub fn play_with(&self, sound: Sound, play: Play) -> Voice {
+        let how = Spawn {
+            looping: play.looping,
+            priority: play.priority,
         };
-        self.spawn(sound, looping, 1.0)
+        let rate = if play.rate.is_finite() && play.rate > 0.0 {
+            play.rate
+        } else {
+            1.0
+        };
+        let pan = if play.pan.is_nan() {
+            0.0
+        } else {
+            play.pan.clamp(-1.0, 1.0)
+        };
+        let gain = play.gain.max(0.0);
+        let lowpass_hz = play.lowpass_hz.filter(|hz| hz.is_finite() && *hz > 0.0);
+        if rate == 1.0 && lowpass_hz.is_none() {
+            return self.spawn(sound, how, gain, pan);
+        }
+        // Not a patch of this engine: nothing to play.
+        let Some(frames) = self.samples(sound) else {
+            return Voice::INERT;
+        };
+        let voice = self.inner.next_voice.fetch_add(1, Ordering::Relaxed);
+        let sampled = Sampled {
+            frames,
+            gain,
+            pan,
+            rate,
+            lowpass_hz,
+            looping: play.looping,
+        };
+        self.send(Command::PlaySampled {
+            voice,
+            sampled,
+            slot: self.inner.slot.clone(),
+            priority: play.priority,
+        });
+        Voice(voice)
     }
 
     /// Render the sound here (once), then hand the mixer a voice to start.
-    fn spawn(&self, sound: Sound, how: Spawn, gain: f32) -> Voice {
+    fn spawn(&self, sound: Sound, how: Spawn, gain: f32, pan: f32) -> Voice {
         // Not a patch of this engine: nothing to play.
         let Some(prepared) = self.rendered_voice(sound) else {
             return Voice::INERT;
@@ -263,8 +376,25 @@ impl TonoAudio {
             prepared,
             how,
             gain,
+            pan,
         });
         Voice(voice)
+    }
+
+    /// The sound's interleaved stereo render, rendering it here the first time.
+    fn samples(&self, sound: Sound) -> Option<Arc<[f32]>> {
+        if let Some(frames) = lock(&self.inner.samples).get(&sound.0) {
+            return Some(frames.clone());
+        }
+        let doc = lock(&self.inner.registry).docs.get(&sound.0)?.clone();
+        let (left, right) = tono_core::player::render_stereo(&doc);
+        let frames: Arc<[f32]> = left
+            .iter()
+            .zip(&right)
+            .flat_map(|(&l, &r)| [l, r])
+            .collect();
+        lock(&self.inner.samples).insert(sound.0, frames.clone());
+        Some(frames)
     }
 
     /// The sound's rendered voice, rendering it on this thread the first time.
@@ -535,24 +665,89 @@ impl TonoAudio {
 /// alternative to reaching for [`TonoAudio`] in a system. A game system takes a
 /// `MessageWriter<PlaySfx>` and writes `PlaySfx::new(sound)`; [`TonoPlugin`]
 /// drains the queue each frame and plays them.
+///
+/// The fields mirror [`Play`]; build one with [`PlaySfx::new`] and the
+/// `with_*` methods.
 #[derive(Message, Clone, Copy, Debug)]
 pub struct PlaySfx {
     /// The registered sound to play.
     pub sound: Sound,
     /// Playback gain (1.0 = unity).
     pub gain: f32,
+    /// Stereo balance, −1..1 (see [`Play::pan`]).
+    pub pan: f32,
+    /// Playback rate (see [`Play::rate`]).
+    pub rate: f32,
+    /// Per-voice lowpass cutoff in Hz (see [`Play::lowpass_hz`]).
+    pub lowpass_hz: Option<f32>,
+    /// Importance under a voice cap.
+    pub priority: Priority,
+    /// Loop until stopped.
+    pub looping: bool,
 }
 
 impl PlaySfx {
     /// Play `sound` at unity gain.
     pub fn new(sound: Sound) -> Self {
-        PlaySfx { sound, gain: 1.0 }
+        let play = Play::default();
+        PlaySfx {
+            sound,
+            gain: play.gain,
+            pan: play.pan,
+            rate: play.rate,
+            lowpass_hz: play.lowpass_hz,
+            priority: play.priority,
+            looping: play.looping,
+        }
     }
 
     /// Set the gain (0..).
     pub fn with_gain(mut self, gain: f32) -> Self {
         self.gain = gain;
         self
+    }
+
+    /// Set the stereo balance (−1..1).
+    pub fn with_pan(mut self, pan: f32) -> Self {
+        self.pan = pan;
+        self
+    }
+
+    /// Set the playback rate (pitch and length together).
+    pub fn with_rate(mut self, rate: f32) -> Self {
+        self.rate = rate;
+        self
+    }
+
+    /// Filter this voice through a one-pole lowpass at `hz`.
+    pub fn with_lowpass(mut self, hz: f32) -> Self {
+        self.lowpass_hz = Some(hz);
+        self
+    }
+
+    /// Set the priority under a voice cap.
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Loop until stopped (the voice is not returned, so a looping message
+    /// suits a bed that plays for the app's life).
+    pub fn looping(mut self) -> Self {
+        self.looping = true;
+        self
+    }
+
+    /// The per-play controls this message carries.
+    pub fn play(&self) -> Play {
+        Play {
+            gain: self.gain,
+            pan: self.pan,
+            rate: self.rate,
+            lowpass_hz: self.lowpass_hz,
+            priority: self.priority,
+            looping: self.looping,
+        }
     }
 }
 
@@ -597,7 +792,7 @@ pub struct StopNote {
 /// Drain queued [`PlaySfx`] messages and fire them on the audio bus.
 fn play_queued_sfx(mut sfx: MessageReader<PlaySfx>, audio: Res<TonoAudio>) {
     for e in sfx.read() {
-        audio.play_with_gain(e.sound, e.gain);
+        audio.play_with(e.sound, e.play());
     }
 }
 

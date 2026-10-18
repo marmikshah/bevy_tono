@@ -99,7 +99,10 @@ pub(crate) fn write_device<T>(
         let frames = chunk.len() / channels;
         let mixed = &mut stereo[..frames * 2];
         mixer.fill(mixed);
-        for (frame, lr) in chunk.chunks_exact_mut(channels).zip(mixed.chunks_exact(2)) {
+        for (frame, lr) in chunk
+            .chunks_exact_mut(channels)
+            .zip(mixed.as_chunks::<2>().0)
+        {
             let (l, r) = (lr[0], lr[1]);
             if channels == 1 {
                 frame[0] = T::from_sample(0.5 * (l + r));

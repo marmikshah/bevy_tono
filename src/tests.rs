@@ -467,7 +467,12 @@ fn integer_devices_get_the_same_mix() {
         let mut data = vec![0i16; 512 * 3];
         let mut scratch = vec![0.0f32; 64 * 2];
         output::write_device(mixer, &mut data, 3, &mut scratch);
-        for (lr, frame) in stereo.chunks_exact_mut(2).zip(data.chunks_exact(3)) {
+        for (lr, frame) in stereo
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(data.as_chunks::<3>().0)
+        {
             assert_eq!(frame[2], 0, "extra channels are silent");
             lr[0] = frame[0] as f32 / i16::MAX as f32;
             lr[1] = frame[1] as f32 / i16::MAX as f32;
@@ -477,7 +482,7 @@ fn integer_devices_get_the_same_mix() {
         let mut data = vec![0u16; 512];
         let mut scratch = vec![0.0f32; 512 * 2];
         output::write_device(mixer, &mut data, 1, &mut scratch);
-        for (lr, &m) in stereo.chunks_exact_mut(2).zip(&data) {
+        for (lr, &m) in stereo.as_chunks_mut::<2>().0.iter_mut().zip(&data) {
             let v = (m as f32 - 32_768.0) / 32_768.0;
             lr[0] = v;
             lr[1] = v;
@@ -487,7 +492,7 @@ fn integer_devices_get_the_same_mix() {
     for (a, b) in float.iter().zip(&wide) {
         assert!((a - b).abs() < 1e-3, "i16 tracks f32");
     }
-    for (pair, b) in float.chunks_exact(2).zip(mono.chunks_exact(2)) {
+    for (pair, b) in float.as_chunks::<2>().0.iter().zip(mono.as_chunks::<2>().0) {
         assert!(
             (0.5 * (pair[0] + pair[1]) - b[0]).abs() < 1e-3,
             "u16 mono is the mid"
@@ -504,4 +509,184 @@ fn the_plugin_starts_with_or_without_a_device() {
     let sound = audio.register(&blip());
     audio.play(sound);
     assert!(audio.sample_rate() > 0);
+}
+
+/// Mix one play on a fresh mixer for `frames` frames.
+fn render_play(play: impl Fn(&TonoAudio, Sound), frames: usize) -> Vec<f32> {
+    let (audio, mut mixer) = manual();
+    let sound = audio.register(&blip());
+    play(&audio, sound);
+    pull(&mut mixer, frames)
+}
+
+#[test]
+fn rate_one_is_bit_identical_to_play() {
+    let plain = render_play(
+        |a, s| {
+            a.play(s);
+        },
+        6_000,
+    );
+    let with = render_play(
+        |a, s| {
+            a.play_with(
+                s,
+                Play {
+                    rate: 1.0,
+                    ..Play::default()
+                },
+            );
+        },
+        6_000,
+    );
+    assert!(peak(&plain) > 0.1);
+    assert_eq!(bits(&plain), bits(&with));
+    let gained = render_play(
+        |a, s| {
+            a.play_with_gain(s, 0.3);
+        },
+        6_000,
+    );
+    let with_gain = render_play(
+        |a, s| {
+            a.play_with(
+                s,
+                Play {
+                    gain: 0.3,
+                    ..Play::default()
+                },
+            );
+        },
+        6_000,
+    );
+    assert_eq!(bits(&gained), bits(&with_gain));
+}
+
+#[test]
+fn rate_resamples_pitch_and_length_together() {
+    let (audio, mut mixer) = manual();
+    let sound = audio.register(&blip());
+    let rendered = audio.samples(sound).unwrap();
+    let frames = rendered.len() / 2;
+    audio.play_with(
+        sound,
+        Play {
+            rate: 2.0,
+            ..Play::default()
+        },
+    );
+    let out = pull(&mut mixer, frames);
+    // At rate 2 every output frame is every second rendered frame, exactly.
+    for f in 0..frames / 2 {
+        assert_eq!(out[f * 2], rendered[f * 4], "frame {f}");
+    }
+    assert!(
+        peak(&out[frames..]) == 0.0,
+        "and it ends at half the length"
+    );
+    assert_eq!(mixer.sampled.len(), 0, "the voice finished");
+    pull(&mut mixer, 1_000);
+    assert_eq!(mixer.engine.active(), 0, "its engine slot is given back");
+}
+
+#[test]
+fn lowpass_and_pan_shape_a_voice() {
+    let open = render_play(
+        |a, s| {
+            a.play(s);
+        },
+        4_000,
+    );
+    let dark = render_play(
+        |a, s| {
+            a.play_with(
+                s,
+                Play {
+                    lowpass_hz: Some(150.0),
+                    ..Play::default()
+                },
+            );
+        },
+        4_000,
+    );
+    assert!(
+        peak(&dark) < peak(&open) * 0.4,
+        "880 Hz through a 150 Hz lowpass"
+    );
+
+    for rate in [1.0, 1.5] {
+        let right = render_play(
+            |a, s| {
+                a.play_with(
+                    s,
+                    Play {
+                        pan: 1.0,
+                        rate,
+                        ..Play::default()
+                    },
+                );
+            },
+            4_000,
+        );
+        let left: Vec<f32> = right.iter().step_by(2).copied().collect();
+        assert_eq!(
+            peak(&left),
+            0.0,
+            "hard right silences the left at rate {rate}"
+        );
+        assert!(peak(&right) > 0.1);
+    }
+}
+
+#[test]
+fn a_sampled_voice_stops_and_takes_gain() {
+    let (audio, mut mixer) = manual();
+    let sound = audio.register(&pad());
+    let voice = audio.play_with(
+        sound,
+        Play {
+            rate: 0.5,
+            looping: true,
+            ..Play::default()
+        },
+    );
+    pull(&mut mixer, 48_000); // a 0.5 s doc at half rate, looped past its end
+    assert_eq!(mixer.sampled.len(), 1, "the loop keeps playing");
+    audio.set_gain(voice, 0.0);
+    pull(&mut mixer, 2_000);
+    assert_eq!(peak(&pull(&mut mixer, 256)), 0.0, "gain 0 silences it");
+    audio.stop(voice);
+    pull(&mut mixer, 2_000);
+    assert_eq!(mixer.sampled.len(), 0);
+    pull(&mut mixer, 1_000);
+    assert_eq!(mixer.engine.active(), 0, "its slot is given back");
+}
+
+#[test]
+fn play_sfx_builders_reach_the_mixer() {
+    let (mut app, audio, mut mixer) = audio_app();
+    let sound = audio.register(&blip());
+    let sfx = PlaySfx::new(sound)
+        .with_gain(0.5)
+        .with_pan(-0.5)
+        .with_rate(1.25)
+        .with_lowpass(4_000.0)
+        .with_priority(Priority::HIGH);
+    assert_eq!(
+        sfx.play(),
+        Play {
+            gain: 0.5,
+            pan: -0.5,
+            rate: 1.25,
+            lowpass_hz: Some(4_000.0),
+            priority: Priority::HIGH,
+            looping: false,
+        }
+    );
+    app.world_mut().write_message(sfx);
+    app.world_mut().write_message(PlaySfx::new(sound).looping());
+    app.update();
+    pull(&mut mixer, 64);
+    assert_eq!(mixer.sampled.len(), 1, "the resampled one");
+    assert_eq!(mixer.engine.active(), 2, "its slot and the looping one");
 }
