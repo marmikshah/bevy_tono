@@ -690,3 +690,61 @@ fn play_sfx_builders_reach_the_mixer() {
     assert_eq!(mixer.sampled.len(), 1, "the resampled one");
     assert_eq!(mixer.engine.active(), 2, "its slot and the looping one");
 }
+
+#[test]
+fn variation_varies_each_play_and_repeats_each_run() {
+    let wide = Variation {
+        pitch: 0.05,
+        pan: 0.5,
+        level: 0.2,
+    };
+    let run = || {
+        let (audio, mut mixer) = manual();
+        let sound = audio.register_with(&blip(), wide);
+        let plays: Vec<Vec<u32>> = (0..3)
+            .map(|_| {
+                audio.play(sound);
+                let out = bits(&pull(&mut mixer, 6_000));
+                pull(&mut mixer, 6_000);
+                out
+            })
+            .collect();
+        plays
+    };
+    let first = run();
+    assert_ne!(first[0], first[1], "repeats are not stamped out");
+    assert_ne!(first[1], first[2]);
+    assert_eq!(first, run(), "the same plays vary the same way every run");
+
+    // Without a variation nothing changes.
+    let (audio, mut mixer) = manual();
+    let sound = audio.register_with(&blip(), Variation::default());
+    audio.play(sound);
+    let plain = render_play(
+        |a, s| {
+            a.play(s);
+        },
+        6_000,
+    );
+    assert_eq!(bits(&pull(&mut mixer, 6_000)), bits(&plain));
+    assert!(mixer.sampled.is_empty(), "the engine plays it, as before");
+}
+
+#[test]
+fn variation_stays_in_its_ranges() {
+    let (audio, _mixer) = manual();
+    let sound = audio.register_with(
+        &blip(),
+        Variation {
+            pitch: 0.04,
+            pan: 0.3,
+            level: 0.1,
+        },
+    );
+    for _ in 0..500 {
+        let p = audio.varied(sound, Play::default());
+        assert!((0.96..=1.04).contains(&p.rate), "{p:?}");
+        assert!((-0.3..=0.3).contains(&p.pan), "{p:?}");
+        assert!((0.9..=1.0).contains(&p.gain), "{p:?}");
+    }
+}

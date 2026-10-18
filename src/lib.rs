@@ -29,7 +29,7 @@
 //! silence, so the music clock still advances.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 
 use bevy::prelude::*;
@@ -185,6 +185,24 @@ impl Default for Play {
     }
 }
 
+/// Per-play variation a [`Sound`] carries (see
+/// [`TonoAudio::register_with`]), so a cue repeated often does not sound
+/// stamped out. Each field is the width of a uniform random offset drawn on
+/// every play; the default is no variation at all.
+///
+/// The offsets come from a seeded generator, not the clock: the same plays
+/// in the same order vary the same way every run.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Variation {
+    /// Rate spread: each play's rate is scaled by `1 ± pitch` (0.03 ≈ half a
+    /// semitone either way).
+    pub pitch: f32,
+    /// Pan spread: each play's pan moves by up to `± pan`.
+    pub pan: f32,
+    /// Level spread: each play's gain drops by up to this fraction.
+    pub level: f32,
+}
+
 /// A live, polyphonic instrument you can play note-by-note (from a preset or an
 /// [`InstrumentDesign`]). Register one, then `note_on`/`note_off`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -211,6 +229,8 @@ struct Inner {
     /// The silent engine voice a resampled voice holds its place with.
     slot: PreparedVoice,
     next_voice: AtomicU64,
+    /// The variation generator's state (xorshift32).
+    random: AtomicU32,
     sample_rate: u32,
 }
 
@@ -221,6 +241,7 @@ struct Registry {
     engine: Engine,
     /// Each sound's doc at the device rate, to render its sample buffer.
     docs: HashMap<PatchId, SoundDoc>,
+    variations: HashMap<PatchId, Variation>,
     sections: Vec<String>,
     instruments: usize,
     tempo: (f32, u32),
@@ -251,6 +272,7 @@ impl TonoAudio {
                 registry: Mutex::new(Registry {
                     engine,
                     docs: HashMap::new(),
+                    variations: HashMap::new(),
                     sections: Vec::new(),
                     instruments: 0,
                     tempo: (0.0, 4),
@@ -259,6 +281,7 @@ impl TonoAudio {
                 samples: Mutex::default(),
                 slot,
                 next_voice: AtomicU64::new(1),
+                random: AtomicU32::new(0x7f4a_7c15),
                 sample_rate,
             }),
         };
@@ -281,6 +304,43 @@ impl TonoAudio {
         registry.docs.insert(patch, d.clone());
         self.send(Command::Load(Box::new(d)));
         Sound(patch)
+    }
+
+    /// [`register`](Self::register) a sound that varies a little on every
+    /// play — pitch, pan and level, within `variation`'s ranges.
+    pub fn register_with(&self, doc: &SoundDoc, variation: Variation) -> Sound {
+        let sound = self.register(doc);
+        if variation != Variation::default() {
+            let mut registry = lock(&self.inner.registry);
+            registry.variations.insert(sound.0, variation);
+        }
+        sound
+    }
+
+    /// The next variation offset, uniform in −1..1.
+    fn draw(&self) -> f32 {
+        let step = |mut x: u32| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let random = &self.inner.random;
+        let old = random
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(step(x)))
+            .unwrap_or_else(|x| x);
+        (step(old) >> 8) as f32 / 8_388_607.5 - 1.0
+    }
+
+    /// `play` with the sound's variation, if it has one, drawn into it.
+    fn varied(&self, sound: Sound, mut play: Play) -> Play {
+        let variation = lock(&self.inner.registry).variations.get(&sound.0).copied();
+        if let Some(v) = variation {
+            play.rate *= 1.0 + self.draw() * v.pitch;
+            play.pan += self.draw() * v.pan;
+            play.gain *= 1.0 - self.draw().abs() * v.level.clamp(0.0, 1.0);
+        }
+        play
     }
 
     /// Fire a one-shot — the classic SFX trigger. Returns the voice (for stop /
@@ -322,7 +382,11 @@ impl TonoAudio {
     /// holds a silent engine voice, so [`set_max_voices`](Self::set_max_voices)
     /// and [`Priority`] govern it like any other. The first such play of a
     /// sound renders its buffer on the calling thread.
+    ///
+    /// A sound registered with [`register_with`](Self::register_with) varies
+    /// on top of these controls.
     pub fn play_with(&self, sound: Sound, play: Play) -> Voice {
+        let play = self.varied(sound, play);
         let how = Spawn {
             looping: play.looping,
             priority: play.priority,
