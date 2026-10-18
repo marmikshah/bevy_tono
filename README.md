@@ -61,7 +61,12 @@ Run the demo: `cargo run --example play`.
 | `set_intensity(0..1)` | cross-fade the music bed with the action |
 | `stinger(&doc)` | fire a one-shot over the music |
 | `render_stinger(&doc) -> Stinger` / `play_stinger_at(&stinger, q)` | render a stinger on any thread, then fire it — `Quantize::AtBeat(n)` lands it on a beat you computed first |
-| `set_master_gain(0..1)` | global volume — scales the whole bus (SFX + music) |
+| `set_master_gain(0..1)` | global volume — scales the whole bus (SFX + music), ramped |
+| `play_with(sound, Play)` | a voice with gain, pan, rate, lowpass, priority, looping |
+| `register_with(&doc, Variation)` / `prewarm(sound)` | per-play variation; render off the game thread |
+| `set_max_voices(n)` | voice cap with `Priority` stealing |
+| `set_levels(voice, [l, r], ramp)` / `set_music_gain(g, ramp)` | slewed bed levels; a music fader |
+| `transition_to_section_with(s, q, SectionEntry)` | resume a section, or count bars from its entry |
 | `play_song(&Song)` | compile a catalog [`Song`] and bed it as looping music |
 | `preset(name) -> InstrumentId` | register a live, playable instrument from a factory preset |
 | `note_on(inst, note, vel)` / `note_off(inst, note)` / `set_bend(inst, semis)` | play it note-by-note |
@@ -82,12 +87,61 @@ fn play_note(mut on: MessageWriter<PlayNote>, synth: Res<Synth>) {
 frame. Author a whole song with the catalog + `Song` builder and hand it to
 `play_song`, or play an instrument live — see `cargo run --example keys`.
 
-Audio runs on a dedicated thread that owns the `cpal` stream; the callback only
-`try_lock`s, so a game-thread poke never blocks or clicks the output. Every
-render happens before the bus lock is taken, so a long one-shot or stinger
-never gaps the music. A render still costs the calling thread its time: for a
-long cue, call `render_stinger` on a worker (`TonoAudio` is `Clone`). With no
-audio device the plugin degrades to silence rather than failing to start.
+The audio callback owns the mixer: `TonoAudio` sends it commands down a
+lock-free queue and reads the music clock, section and pause state back from
+atomics, so a game-thread call never blocks or drops output. Every render
+happens on the calling thread before the command is sent, so a long one-shot
+or stinger never gaps the music. A render still costs the calling thread its
+time: `prewarm` a sound, or call `render_stinger` on a worker (`TonoAudio` is
+`Clone`). f32, i16 and u16 devices are supported. With no audio device the
+mixer drains in real time into silence, so beats and quantized changes still
+work headless.
+
+## Using it in a game
+
+Options go in a `TonoConfig` resource inserted before the plugin; both are off
+by default:
+
+```rust
+app.insert_resource(TonoConfig {
+    limiter: Some(Limiter::default()),   // a peak limiter on the final mix
+    pause_music_on_focus_loss: true,     // hold the music while unfocused
+})
+.add_plugins(TonoPlugin);
+```
+
+Per-play controls, variation and a voice cap:
+
+```rust
+let step = audio.register_with(&doc, Variation { pitch: 0.03, pan: 0.2, level: 0.1 });
+audio.prewarm(step);                     // render on a worker, not on first play
+audio.set_max_voices(24);                // the engine's cap: lowest priority, oldest, goes first
+
+audio.play_with(step, Play {
+    rate: 1.1,                           // pitch and length together (a resample)
+    pan: -0.4,                           // the engine's balance law
+    lowpass_hz: Some(2_500.0),           // a one-pole lowpass on this voice
+    priority: Priority::HIGH,
+    ..Play::default()                    // Play::default() is exactly `play`
+});
+sfx.write(PlaySfx::new(step).with_rate(0.9).with_priority(Priority::LOW));
+```
+
+Beds, music gain and sections:
+
+```rust
+let wind = audio.play_looping(wind_sound);
+audio.set_levels(wind, [0.2, 0.6], Duration::from_millis(80)); // left, right, slew
+// Beds are voices: music_pause and music_reset leave them playing.
+
+audio.set_music_gain(0.5, Duration::from_millis(300));          // a music fader
+audio.transition_to_section_with(cave, Quantize::Bars(4), SectionEntry {
+    resume: true,      // pick the section up where it left off
+    from_entry: true,  // count the 4 bars from when the sounding section entered
+});
+```
+
+`set_master_gain` ramps over 10 ms rather than stepping.
 
 Sounds are authored as `SoundDoc` JSON — see the
 [tono cookbook](https://github.com/marmikshah/tono/blob/master/docs/cookbook.md)
@@ -108,12 +162,13 @@ cargo run --example keys  # A–K play a live instrument
 On Linux, Bevy's examples need `libasound2-dev libudev-dev libwayland-dev
 libxkbcommon-dev`.
 
-Everything lives in `src/lib.rs`: `TonoPlugin` and `TonoAudio`, the
-`PlaySfx` / `PlayNote` / `StopNote` messages, `GameBus` (the SFX engine, music
-bed and instruments summed to stereo), the cpal thread (`spawn_audio` →
-`build_stream` → `fill_output`), and the `review` module. The tests sit at the
-bottom of that file and drive `GameBus`, or `TonoPlugin` under
-`MinimalPlugins`, with no device. The demos are in `examples/`.
+`src/lib.rs` holds the public API: `TonoPlugin`, `TonoConfig`, `TonoAudio`,
+`Play`, the messages and the `review` module. `src/mixer.rs` is the mixer the
+callback owns (the `Command`s it applies, the sample player for resampled
+voices, the limiter), `src/sections.rs` the section player, and
+`src/output.rs` the cpal thread and the headless drain. `src/tests.rs` drives a
+mixer directly, with no device or thread, including a copy of the 0.6 bus the
+mix is checked against sample for sample. The demos are in `examples/`.
 
 To work on tono-core alongside the plugin, point cargo at a local checkout,
 and don't commit it (a release refuses a `[patch]`):
