@@ -45,6 +45,7 @@ pub use tono_core::runtime::Priority;
 
 mod mixer;
 mod output;
+mod sections;
 #[cfg(test)]
 mod tests;
 
@@ -201,6 +202,25 @@ pub struct Variation {
     pub pan: f32,
     /// Level spread: each play's gain drops by up to this fraction.
     pub level: f32,
+}
+
+/// How a section enters on [`TonoAudio::transition_to_section_with`]. The
+/// default is what [`TonoAudio::transition_to_section`] does: from the
+/// section's head, on the grid counted from the last
+/// [`music_reset`](TonoAudio::music_reset).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SectionEntry {
+    /// Pick the section up where it was when it was last left, instead of
+    /// rewinding it to its head — returning to a place resumes its music.
+    /// A section that has not played yet (or since a reset) starts at its
+    /// head either way.
+    pub resume: bool,
+    /// Count [`Quantize::Beat`], [`Bar`](Quantize::Bar) and
+    /// [`Bars(n)`](Quantize::Bars) from the frame the sounding section
+    /// entered (its phrase origin) rather than from the last reset, so a
+    /// `Bars(4)` change lands on that section's own phrase boundary.
+    /// [`Quantize::AtBeat`] stays absolute.
+    pub from_entry: bool,
 }
 
 /// A live, polyphonic instrument you can play note-by-note (from a preset or an
@@ -679,8 +699,8 @@ impl TonoAudio {
         let name = name.into();
         let mut registry = lock(&self.inner.registry);
         let index = registry.sections.len();
-        registry.sections.push(name.clone());
-        self.send(Command::Section(name, buffer));
+        registry.sections.push(name);
+        self.send(Command::Section(buffer));
         // The first section plays at once; say so before the mixer does.
         if index == 0 {
             let current = &self.inner.state.current_section;
@@ -695,7 +715,19 @@ impl TonoAudio {
     /// re-sequencing (swap "explore" for "battle" on the next bar, no mid-phrase
     /// cut).
     pub fn transition_to_section(&self, section: usize, quantize: Quantize) {
-        self.send(Command::Transition(section, quantize));
+        self.transition_to_section_with(section, quantize, SectionEntry::default());
+    }
+
+    /// [`transition_to_section`](Self::transition_to_section) with a choice
+    /// of how the section enters (see [`SectionEntry`]): from where it left
+    /// off, and/or on a grid counted from the sounding section's entry.
+    pub fn transition_to_section_with(
+        &self,
+        section: usize,
+        quantize: Quantize,
+        entry: SectionEntry,
+    ) {
+        self.send(Command::Transition(section, quantize, entry));
     }
 
     /// The section currently sounding, if any.

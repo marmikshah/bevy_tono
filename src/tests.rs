@@ -950,3 +950,144 @@ fn prewarm_renders_off_the_calling_thread() {
     pull(&mut mixer, 64);
     assert_eq!(mixer.engine.active(), 1);
 }
+
+fn tone(freq: u32) -> SoundDoc {
+    let mut d = doc(&format!(
+        r#"{{ "name":"t{freq}", "duration":0.5, "engine":2, "root": {{ "type":"sine", "freq":{freq} }} }}"#
+    ));
+    d.sample_rate = 48_000;
+    d
+}
+
+#[test]
+fn sections_match_the_beds_own_sections_sample_for_sample() {
+    use crate::sections::Sections;
+
+    let mut ours = Sections::new(48_000);
+    let mut theirs = AdaptiveMusic::new(48_000);
+    for f in [220, 330, 440] {
+        ours.add(LoopBuffer::from_doc(&tone(f)));
+        theirs.add_section_buffer(format!("{f}"), LoopBuffer::from_doc(&tone(f)));
+    }
+    ours.set_tempo(132.0, 3);
+    theirs.set_tempo(132.0, 3);
+    let plain = SectionEntry::default();
+    let mut block = 0;
+    let mut run = |ours: &mut Sections, theirs: &mut AdaptiveMusic, frames: usize| {
+        let mut done = 0;
+        while done < frames {
+            let n = (97 + 211 * (block % 7)).min(frames - done);
+            block += 1;
+            let (mut a, mut b) = (vec![0.0f32; n * 2], vec![0.0f32; n * 2]);
+            ours.fill(&mut a);
+            theirs.fill(&mut b);
+            assert_eq!(bits(&a), bits(&b), "block {block}");
+            done += n;
+        }
+    };
+    type Step = (usize, Quantize, usize);
+    let steps: [Step; 9] = [
+        (1, Quantize::Bar, 70_000),
+        (2, Quantize::Beat, 1_000), // mid-fade: queues behind it
+        (1, Quantize::Immediate, 6_000),
+        (0, Quantize::Immediate, 900), // back to the source mid-fade: reverses
+        (1, Quantize::Immediate, 600),
+        (2, Quantize::Bars(2), 200_000),
+        (0, Quantize::AtBeat(30), 50_000),
+        (0, Quantize::Bar, 10_000),       // already current: a no-op
+        (9, Quantize::Immediate, 10_000), // unknown: a no-op
+    ];
+    for (to, q, frames) in steps {
+        ours.transition_to(to, q, plain);
+        theirs.transition_to(to, q);
+        run(&mut ours, &mut theirs, frames);
+        assert_eq!(ours.current(), theirs.current_section());
+    }
+    ours.transition_to(1, Quantize::Bar, plain);
+    theirs.transition_to(1, Quantize::Bar);
+    AudioSource::reset(&mut ours);
+    theirs.reset();
+    run(&mut ours, &mut theirs, 100_000);
+}
+
+/// A tone's rendered left channel at `frame` (looped).
+fn read_tone(freq: u32, frame: usize) -> f32 {
+    let (left, _) = tono_core::player::render_stereo(&tone(freq));
+    left[frame % left.len()]
+}
+
+#[test]
+fn a_resumed_section_picks_up_where_it_left_off() {
+    use crate::sections::Sections;
+
+    let fade = 2_880; // 60 ms
+    for resume in [false, true] {
+        let mut s = Sections::new(48_000);
+        s.add(LoopBuffer::from_doc(&tone(220)));
+        s.add(LoopBuffer::from_doc(&tone(330)));
+        let mut out = vec![0.0f32; 4_800 * 2];
+        s.fill(&mut out); // 220 plays 4 800 frames
+        s.transition_to(1, Quantize::Immediate, SectionEntry::default());
+        s.fill(&mut vec![0.0f32; (fade + 1_000) * 2]); // 220 left at 4 800 + fade
+        let entry = SectionEntry {
+            resume,
+            ..SectionEntry::default()
+        };
+        s.transition_to(0, Quantize::Immediate, entry);
+        s.fill(&mut vec![0.0f32; fade * 2]);
+        assert_eq!(s.current(), Some(0));
+        let mut back = vec![0.0f32; 64 * 2];
+        s.fill(&mut back);
+        let head = if resume { 4_800 + fade + fade } else { fade };
+        for f in 0..64 {
+            assert_eq!(
+                back[f * 2],
+                read_tone(220, head + f),
+                "resume {resume} frame {f}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bars_can_count_from_the_sections_entry() {
+    use crate::sections::Sections;
+
+    let (bar, fade) = (96_000, 2_880); // 120 bpm, 4/4, 48 kHz; a 60 ms fade
+    for (from_entry, lands) in [(false, bar), (true, 30_000 + bar)] {
+        let mut s = Sections::new(48_000);
+        s.set_tempo(120.0, 4);
+        for f in [220, 330, 440] {
+            s.add(LoopBuffer::from_doc(&tone(f)));
+        }
+        s.fill(&mut vec![0.0f32; 30_000 * 2]);
+        s.transition_to(1, Quantize::Immediate, SectionEntry::default()); // enters at 30 000
+        s.fill(&mut vec![0.0f32; 4_000 * 2]);
+        let entry = SectionEntry {
+            from_entry,
+            ..SectionEntry::default()
+        };
+        s.transition_to(2, Quantize::Bars(1), entry);
+        s.fill(&mut vec![0.0f32; (lands + fade - 34_000 - 1) * 2]);
+        assert_eq!(s.current(), Some(1), "still fading in: {from_entry}");
+        s.fill(&mut [0.0f32; 2 * 2]);
+        assert_eq!(s.current(), Some(2), "landed on frame {lands}");
+    }
+}
+
+#[test]
+fn transition_with_reaches_the_mixer() {
+    let (audio, mut mixer) = manual();
+    let a = audio.add_section("a", &tone(220));
+    let b = audio.add_section("b", &tone(330));
+    let entry = SectionEntry {
+        resume: true,
+        from_entry: true,
+    };
+    audio.transition_to_section_with(b, Quantize::Immediate, entry);
+    pull(&mut mixer, 4_000);
+    assert_eq!(audio.current_section(), Some(b));
+    audio.transition_to_section_with(a, Quantize::Immediate, entry);
+    pull(&mut mixer, 4_000);
+    assert_eq!(audio.current_section(), Some(a));
+}
