@@ -10,9 +10,11 @@ are the rules an edit must not break:
   missing audio device degrades to a real-time silent drain, never a startup
   failure.
 - Determinism is tono's contract: the same `SoundDoc` sounds identical every
-  run. Don't add nondeterminism (wall-clock, RNG) between the doc and the bus.
-- The lib takes the minimal bevy surface (`default-features = false`) so the
-  game picks its own features; full `bevy` stays in `[dev-dependencies]`.
+  run. Don't add nondeterminism (wall-clock, unseeded RNG) between the doc and
+  the bus; `Variation` draws from a seeded generator.
+- The lib takes the minimal bevy surface (`default-features = false`, plus
+  `bevy_window` for focus messages) so the game picks its own features; full
+  `bevy` stays in `[dev-dependencies]`.
 - Never commit a `[patch]` section: `cargo publish` ignores it, so the crate
   would ship untested, and `release.yml` refuses it.
 - Open source: keep examples/docs free of any personal or company identifiers.

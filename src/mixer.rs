@@ -83,6 +83,8 @@ pub(crate) enum Command {
     Stinger(Stinger),
     StingerAt(Stinger, Quantize),
     Pause(bool),
+    /// Hold the music while the app is unfocused or suspended.
+    Suspend(bool),
     Reset(u64),
     Tempo(f32, u32),
     Duck(f32, Duration),
@@ -156,6 +158,8 @@ pub(crate) struct Mixer {
     limiter: Option<LimiterState>,
     /// The newest reset applied, published with the position it produced.
     reset_seen: u64,
+    paused: bool,
+    suspended: bool,
     published_section: usize,
 }
 
@@ -187,6 +191,8 @@ impl Mixer {
             music_gain: Ramp::new(1.0),
             limiter: config.limiter.map(|l| LimiterState::new(l, sample_rate)),
             reset_seen: 0,
+            paused: false,
+            suspended: false,
             published_section: NO_SECTION,
         }
     }
@@ -322,8 +328,14 @@ impl Mixer {
             Command::IntensityAt(x, q) => self.music.set_intensity_at(finite_or_zero(x), q),
             Command::Stinger(stinger) => self.music.play_stinger(&stinger),
             Command::StingerAt(stinger, q) => self.music.play_stinger_at(&stinger, q),
-            Command::Pause(true) => self.music.pause(),
-            Command::Pause(false) => self.music.resume(),
+            Command::Pause(paused) => {
+                self.paused = paused;
+                self.hold_music();
+            }
+            Command::Suspend(suspended) => {
+                self.suspended = suspended;
+                self.hold_music();
+            }
             Command::Reset(epoch) => {
                 self.music.reset();
                 self.reset_seen = epoch;
@@ -357,6 +369,15 @@ impl Mixer {
             }
             Command::MasterGain(gain) => self.master_gain.to(gain, ms_frames(MASTER_RAMP_MS, sr)),
             Command::MusicGain(gain, frames) => self.music_gain.to(gain, frames),
+        }
+    }
+
+    /// Pause the bed while the game or the app's focus asks for it.
+    fn hold_music(&mut self) {
+        if self.paused || self.suspended {
+            self.music.pause();
+        } else {
+            self.music.resume();
         }
     }
 

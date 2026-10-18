@@ -44,7 +44,7 @@ fn audio_app() -> (App, TonoAudio, Mixer) {
     let (audio, mixer) = manual();
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
-    install(&mut app, audio.clone());
+    install(&mut app, audio.clone(), &TonoConfig::default());
     (app, audio, mixer)
 }
 
@@ -241,6 +241,7 @@ fn the_limiter_holds_its_ceiling_and_is_off_by_default() {
             ceiling: 0.8,
             release: std::time::Duration::from_millis(50),
         }),
+        ..TonoConfig::default()
     });
     assert!(peak(&limited) <= 0.8 + 1e-6, "{}", peak(&limited));
     assert!(peak(&limited) > 0.7);
@@ -1090,4 +1091,76 @@ fn transition_with_reaches_the_mixer() {
     audio.transition_to_section_with(a, Quantize::Immediate, entry);
     pull(&mut mixer, 4_000);
     assert_eq!(audio.current_section(), Some(a));
+}
+
+#[test]
+fn music_holds_while_the_app_is_unfocused_or_suspended() {
+    use bevy::window::{AppLifecycle, WindowFocused};
+
+    let (audio, mut mixer) = manual();
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .add_message::<WindowFocused>()
+        .add_message::<AppLifecycle>();
+    let config = TonoConfig {
+        pause_music_on_focus_loss: true,
+        ..TonoConfig::default()
+    };
+    install(&mut app, audio.clone(), &config);
+    audio.music_layer(&pad(), 0.0);
+    let focus = |app: &mut App, focused: bool| {
+        app.world_mut().write_message(WindowFocused {
+            window: Entity::PLACEHOLDER,
+            focused,
+        });
+        app.update();
+    };
+
+    pull(&mut mixer, 1_000);
+    focus(&mut app, false);
+    pull(&mut mixer, 1_000);
+    assert_eq!(audio.music_position_frames(), 1_000, "held while unfocused");
+    assert!(
+        !audio.music_is_paused(),
+        "the game's own pause is untouched"
+    );
+    focus(&mut app, true);
+    pull(&mut mixer, 1_000);
+    assert_eq!(audio.music_position_frames(), 2_000, "and picks up again");
+
+    // A game pause outlasts a focus round trip.
+    audio.music_pause();
+    focus(&mut app, false);
+    focus(&mut app, true);
+    pull(&mut mixer, 1_000);
+    assert_eq!(
+        audio.music_position_frames(),
+        2_000,
+        "still paused by the game"
+    );
+    audio.music_resume();
+
+    app.world_mut().write_message(AppLifecycle::Suspended);
+    app.update();
+    pull(&mut mixer, 1_000);
+    assert_eq!(audio.music_position_frames(), 2_000, "held while suspended");
+    app.world_mut().write_message(AppLifecycle::Running);
+    app.update();
+    pull(&mut mixer, 1_000);
+    assert_eq!(audio.music_position_frames(), 3_000);
+}
+
+#[test]
+fn focus_is_ignored_unless_asked_for() {
+    use bevy::window::WindowFocused;
+
+    let (mut app, audio, mut mixer) = audio_app();
+    app.add_message::<WindowFocused>();
+    app.world_mut().write_message(WindowFocused {
+        window: Entity::PLACEHOLDER,
+        focused: false,
+    });
+    app.update();
+    pull(&mut mixer, 1_000);
+    assert_eq!(audio.music_position_frames(), 1_000);
 }

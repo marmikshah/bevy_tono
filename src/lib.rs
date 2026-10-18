@@ -985,6 +985,12 @@ pub struct TonoConfig {
     /// A peak limiter on the final mix, so coincident loud cues bend under a
     /// ceiling instead of clipping. Off by default.
     pub limiter: Option<Limiter>,
+    /// Hold the music bed while the window is unfocused or the app is
+    /// suspended, and pick it up where it was on return. Separate from
+    /// [`music_pause`](TonoAudio::music_pause): a game's own pause stays as
+    /// the game left it, and [`music_is_paused`](TonoAudio::music_is_paused)
+    /// reports only that. SFX and beds keep playing. Off by default.
+    pub pause_music_on_focus_loss: bool,
 }
 
 /// A stereo-linked peak limiter on the output: it pulls the gain down at
@@ -1019,15 +1025,52 @@ impl Plugin for TonoPlugin {
             .get_resource::<TonoConfig>()
             .cloned()
             .unwrap_or_default();
-        install(app, output::spawn_audio(&config));
+        install(app, output::spawn_audio(&config), &config);
     }
 }
 
 /// Insert the resource and wire the messages that feed it.
-fn install(app: &mut App, audio: TonoAudio) {
+fn install(app: &mut App, audio: TonoAudio, config: &TonoConfig) {
     app.insert_resource(audio)
         .add_message::<PlaySfx>()
         .add_message::<PlayNote>()
         .add_message::<StopNote>()
         .add_systems(Update, (play_queued_sfx, drain_notes));
+    if config.pause_music_on_focus_loss {
+        use bevy::ecs::message::Messages;
+        use bevy::window::{AppLifecycle, WindowFocused};
+        app.add_systems(
+            PreUpdate,
+            (
+                follow_focus.run_if(resource_exists::<Messages<WindowFocused>>),
+                follow_lifecycle.run_if(resource_exists::<Messages<AppLifecycle>>),
+            ),
+        );
+    }
+}
+
+/// Hold the music while the window is unfocused.
+fn follow_focus(mut focus: MessageReader<bevy::window::WindowFocused>, audio: Res<TonoAudio>) {
+    if let Some(e) = focus.read().last() {
+        audio.send(Command::Suspend(!e.focused));
+    }
+}
+
+/// Hold the music while the app is suspended (sent to the background).
+fn follow_lifecycle(
+    mut lifecycle: MessageReader<bevy::window::AppLifecycle>,
+    audio: Res<TonoAudio>,
+) {
+    use bevy::window::AppLifecycle;
+    for e in lifecycle.read() {
+        match e {
+            AppLifecycle::WillSuspend | AppLifecycle::Suspended => {
+                audio.send(Command::Suspend(true));
+            }
+            AppLifecycle::WillResume | AppLifecycle::Running => {
+                audio.send(Command::Suspend(false));
+            }
+            AppLifecycle::Idle => {}
+        }
+    }
 }
