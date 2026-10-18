@@ -55,14 +55,8 @@ pub use tono_core::adaptive::Stinger;
 pub use tono_core::instrument::Note;
 
 /// Offline, build-time audio audit — render each [`SoundDoc`] and grade it
-/// against tono's review targets, with no audio device.
-///
-/// tono-core has a full review layer (archetype targets, PASS/WARN/FAIL
-/// findings, LUFS / true-peak analysis) but it is only reachable through the CLI
-/// or `tono_core::review` directly, so a game wiring an `audio` build target had
-/// to hand-roll the render → analyse → review glue. This surfaces it: a Makefile
-/// `audio` target renders every registered doc, grades it, and fails on a
-/// `FAIL`.
+/// against tono's review targets, with no audio device. A game's build target
+/// can render every doc, grade it, and fail on a `FAIL`.
 ///
 /// ```no_run
 /// use bevy_tono::review::{self, AuditItem, Archetype};
@@ -514,8 +508,6 @@ pub struct StopNote {
 /// Drain queued [`PlaySfx`] messages and fire them on the audio bus.
 fn play_queued_sfx(mut sfx: MessageReader<PlaySfx>, audio: Res<TonoAudio>) {
     for e in sfx.read() {
-        // Start at the requested gain rather than ramping up from unity, so a
-        // short SFX doesn't play its attack at the wrong level.
         audio.play_with_gain(e.sound, e.gain);
     }
 }

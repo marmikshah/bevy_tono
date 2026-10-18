@@ -6,7 +6,7 @@ your game systems. No cpal/threads to wire up yourself.
 
 ```toml
 [dependencies]
-bevy_tono = "0.1"
+bevy_tono = "0.5"
 ```
 
 That's the only dependency you need — `bevy_tono` re-exports the engine, so
