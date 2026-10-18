@@ -391,9 +391,14 @@ impl TonoAudio {
             x
         };
         let random = &self.inner.random;
-        let old = random
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(step(x)))
-            .unwrap_or_else(|x| x);
+        // A compare-exchange loop rather than `fetch_update`, which newer
+        // toolchains deprecate under another name.
+        let mut old = random.load(Ordering::Relaxed);
+        while let Err(seen) =
+            random.compare_exchange_weak(old, step(old), Ordering::Relaxed, Ordering::Relaxed)
+        {
+            old = seen;
+        }
         (step(old) >> 8) as f32 / 8_388_607.5 - 1.0
     }
 
