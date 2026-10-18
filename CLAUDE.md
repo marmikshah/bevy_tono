@@ -3,10 +3,12 @@
 Commands, layout and releasing are in the README's Contributing section. These
 are the rules an edit must not break:
 
-- The audio callback only ever `try_lock`s the bus — a game-thread poke must
-  never block or click the output, so nothing renders while holding the bus
-  lock (`Engine::prepare`/`spawn_prepared`, `Stinger`, `LoopBuffer` all render
-  first). A missing audio device degrades to silence, never a startup failure.
+- The audio callback owns the mixer (`src/mixer.rs`). The game side only
+  sends `Command`s down the queue and reads atomics back, so a game-thread
+  call never blocks or drops output. Nothing renders in the mixer: every
+  render (one-shots, stingers, stems, sections) happens before the send. A
+  missing audio device degrades to a real-time silent drain, never a startup
+  failure.
 - Determinism is tono's contract: the same `SoundDoc` sounds identical every
   run. Don't add nondeterminism (wall-clock, RNG) between the doc and the bus.
 - The lib takes the minimal bevy surface (`default-features = false`) so the

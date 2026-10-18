@@ -21,25 +21,30 @@
 //! # fn on_jump(audio: Res<TonoAudio>, sfx: Res<Sfx>) { audio.play(sfx.0); }
 //! ```
 //!
-//! Audio runs on a dedicated thread that owns the `cpal` stream; the callback
-//! only ever `try_lock`s, so a control-thread poke never blocks (or clicks) the
-//! output. Every render — one-shots, stingers, stems, sections — therefore runs
-//! before the bus lock is taken, never under it. If no audio device is present
-//! the plugin degrades to silence rather than failing to start.
+//! The audio callback owns the mixer. [`TonoAudio`] sends it commands down a
+//! lock-free queue and reads its state back from atomics, so a game-thread
+//! call never blocks or drops an output buffer. Every render — one-shots,
+//! stingers, stems, sections — runs on the calling thread before the command
+//! is sent. If no audio device is present the mixer drains in real time into
+//! silence, so the music clock still advances.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 
 use bevy::prelude::*;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use tono_core::adaptive::{AdaptiveMusic, LoopBuffer};
+use tono_core::adaptive::LoopBuffer;
 use tono_core::dsl::SoundDoc;
 use tono_core::instrument::{Instrument, InstrumentDesign};
-use tono_core::runtime::{
-    AudioSource, Engine, InstanceHandle, PatchId, PreparedVoice, Spawn, Tween,
-};
+use tono_core::runtime::{Engine, PatchId, PreparedVoice, Spawn, Transport};
+
+mod mixer;
+mod output;
+#[cfg(test)]
+mod tests;
+
+use mixer::{Command, Mixer, NO_SECTION, State};
 
 /// The engine, re-exported so a downstream game needs only `bevy_tono` as a
 /// dependency — author sounds with [`tono_core::dsl::SoundDoc`] without wiring
@@ -133,7 +138,12 @@ pub struct Sound(PatchId);
 
 /// A sounding voice — one playing instance of a [`Sound`].
 #[derive(Clone, Copy, Debug)]
-pub struct Voice(InstanceHandle);
+pub struct Voice(u64);
+
+impl Voice {
+    /// The voice a play that never sounded returns; every control ignores it.
+    const INERT: Voice = Voice(0);
+}
 
 /// A live, polyphonic instrument you can play note-by-note (from a preset or an
 /// [`InstrumentDesign`]). Register one, then `note_on`/`note_off`.
@@ -143,11 +153,31 @@ pub struct InstrumentId(usize);
 /// The Bevy resource: play SFX and drive adaptive music from your systems.
 #[derive(Resource, Clone)]
 pub struct TonoAudio {
-    bus: Arc<Mutex<GameBus>>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    /// The queue to the mixer the audio callback owns.
+    commands: mpsc::Sender<Command>,
+    /// State the mixer publishes, plus the flags this side sets.
+    state: Arc<State>,
+    /// Ids and names handed out here, in the order the mixer receives them.
+    /// The audio callback never takes this lock.
+    registry: Mutex<Registry>,
     /// One rendered voice per played [`Sound`], so a replay renders nothing.
-    /// A lock of its own: the audio callback never touches it.
-    voices: Arc<Mutex<HashMap<PatchId, PreparedVoice>>>,
+    voices: Mutex<HashMap<PatchId, PreparedVoice>>,
+    next_voice: AtomicU64,
     sample_rate: u32,
+}
+
+/// The game side's copy of what it has registered with the mixer.
+struct Registry {
+    /// Every loaded patch, in mixer order, so a voice can be prepared here
+    /// and rendered off the audio thread. Never mixed.
+    engine: Engine,
+    sections: Vec<String>,
+    instruments: usize,
+    tempo: (f32, u32),
 }
 
 /// The rate used when there is none to go by: no audio device, or a doc whose
@@ -159,18 +189,49 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl TonoAudio {
+    /// A resource and the mixer it drives, joined by a fresh command queue.
+    fn with_mixer(sample_rate: u32) -> (TonoAudio, Mixer) {
+        let (tx, rx) = mpsc::channel();
+        let state = Arc::new(State::default());
+        let mixer = Mixer::new(sample_rate, rx, state.clone());
+        let audio = TonoAudio {
+            inner: Arc::new(Inner {
+                commands: tx,
+                state,
+                registry: Mutex::new(Registry {
+                    engine: Engine::new(sample_rate),
+                    sections: Vec::new(),
+                    instruments: 0,
+                    tempo: (0.0, 4),
+                }),
+                voices: Mutex::default(),
+                next_voice: AtomicU64::new(1),
+                sample_rate,
+            }),
+        };
+        (audio, mixer)
+    }
+
+    /// Queue a command for the mixer. Without a running mixer it goes nowhere.
+    fn send(&self, command: Command) {
+        self.inner.commands.send(command).ok();
+    }
+
     /// Load a `SoundDoc` once (resampled to the device rate) so it can be played
     /// cheaply and repeatedly.
     pub fn register(&self, doc: &SoundDoc) -> Sound {
         let mut d = doc.clone();
-        d.sample_rate = self.sample_rate;
-        Sound(lock(&self.bus).engine.load(&d))
+        d.sample_rate = self.inner.sample_rate;
+        // Load and send under one lock, so both engines number it the same.
+        let mut registry = lock(&self.inner.registry);
+        let patch = registry.engine.load(&d);
+        self.send(Command::Load(Box::new(d)));
+        Sound(patch)
     }
 
     /// Fire a one-shot — the classic SFX trigger. Returns the voice (for stop /
     /// gain); the engine reclaims it when it finishes. The first play of a
-    /// sound renders it on the calling thread, outside the bus lock; later
-    /// plays reuse that render.
+    /// sound renders it on the calling thread; later plays reuse that render.
     pub fn play(&self, sound: Sound) -> Voice {
         self.spawn(sound, Spawn::default(), 1.0)
     }
@@ -190,45 +251,41 @@ impl TonoAudio {
         self.spawn(sound, looping, 1.0)
     }
 
-    /// Spawn a voice with the render kept outside the bus lock: the cpal
-    /// callback only try_locks, so a render under it would silence every
-    /// voice and the music for as long as it took.
+    /// Render the sound here (once), then hand the mixer a voice to start.
     fn spawn(&self, sound: Sound, how: Spawn, gain: f32) -> Voice {
-        let Some(voice) = self.rendered_voice(sound) else {
-            // Not a patch of this engine: the engine hands back an inert voice.
-            return Voice(lock(&self.bus).engine.play(sound.0));
+        // Not a patch of this engine: nothing to play.
+        let Some(prepared) = self.rendered_voice(sound) else {
+            return Voice::INERT;
         };
-        let mut bus = lock(&self.bus);
-        let h = bus.engine.spawn_prepared(voice, how);
-        if gain != 1.0 {
-            bus.engine.set_gain(h, gain, Tween::IMMEDIATE);
-        }
-        Voice(h)
+        let voice = self.inner.next_voice.fetch_add(1, Ordering::Relaxed);
+        self.send(Command::Play {
+            voice,
+            prepared,
+            how,
+            gain,
+        });
+        Voice(voice)
     }
 
     /// The sound's rendered voice, rendering it on this thread the first time.
     fn rendered_voice(&self, sound: Sound) -> Option<PreparedVoice> {
-        if let Some(voice) = lock(&self.voices).get(&sound.0) {
+        if let Some(voice) = lock(&self.inner.voices).get(&sound.0) {
             return Some(voice.clone());
         }
-        let mut voice = lock(&self.bus).engine.prepare(sound.0)?;
+        let mut voice = lock(&self.inner.registry).engine.prepare(sound.0)?;
         voice.render();
-        lock(&self.voices).insert(sound.0, voice.clone());
+        lock(&self.inner.voices).insert(sound.0, voice.clone());
         Some(voice)
     }
 
     /// Stop a voice (a short fade avoids a click).
     pub fn stop(&self, voice: Voice) {
-        lock(&self.bus)
-            .engine
-            .stop(voice.0, Tween::ms(8.0, self.sample_rate));
+        self.send(Command::Stop(voice.0));
     }
 
     /// Set a voice's gain (0..).
     pub fn set_gain(&self, voice: Voice, gain: f32) {
-        lock(&self.bus)
-            .engine
-            .set_gain(voice.0, gain, Tween::ms(20.0, self.sample_rate));
+        self.send(Command::Gain(voice.0, gain));
     }
 
     /// Add a looping music stem that fades to full volume once
@@ -236,14 +293,13 @@ impl TonoAudio {
     /// playing). Layer several for reactive game music.
     pub fn music_layer(&self, doc: &SoundDoc, fade_in_at: f32) {
         let mut d = doc.clone();
-        d.sample_rate = self.sample_rate;
-        let stem = LoopBuffer::from_doc(&d);
-        lock(&self.bus).music.add_layer(stem, fade_in_at);
+        d.sample_rate = self.inner.sample_rate;
+        self.send(Command::Layer(LoopBuffer::from_doc(&d), fade_in_at));
     }
 
     /// Set the music intensity, 0..1 — stems cross-fade toward their levels.
     pub fn set_intensity(&self, intensity: f32) {
-        lock(&self.bus).music.set_intensity(intensity);
+        self.send(Command::Intensity(intensity));
     }
 
     /// Fire a one-shot musical stinger over the bed. Renders on the calling
@@ -257,19 +313,19 @@ impl TonoAudio {
     /// from any thread (the resource is `Clone`), keep the result, and play it
     /// as often as you like — a replay neither renders nor copies.
     pub fn render_stinger(&self, doc: &SoundDoc) -> Stinger {
-        Stinger::render(doc, self.sample_rate)
+        Stinger::render(doc, self.inner.sample_rate)
     }
 
     /// Fire a pre-rendered stinger over the bed now.
     pub fn play_stinger(&self, stinger: &Stinger) {
-        lock(&self.bus).music.play_stinger(stinger);
+        self.send(Command::Stinger(stinger.clone()));
     }
 
     /// Fire a pre-rendered stinger on a beat/bar boundary. Pair it with
     /// [`Quantize::AtBeat`] to land on a beat computed before the render, so
     /// the render time cannot push the cue a beat late.
     pub fn play_stinger_at(&self, stinger: &Stinger, quantize: Quantize) {
-        lock(&self.bus).music.play_stinger_at(stinger, quantize);
+        self.send(Command::StingerAt(stinger.clone(), quantize));
     }
 
     /// Compile a [`Song`](tono_core::song::Song) and play it as an always-on
@@ -286,37 +342,41 @@ impl TonoAudio {
     /// every layer hold, so [`music_resume`](Self::music_resume) continues
     /// seamlessly.
     pub fn music_pause(&self) {
-        lock(&self.bus).music.pause();
+        self.inner.state.paused.store(true, Ordering::Release);
+        self.send(Command::Pause(true));
     }
 
     /// Resume the music bed from a [`music_pause`](Self::music_pause).
     pub fn music_resume(&self) {
-        lock(&self.bus).music.resume();
+        self.inner.state.paused.store(false, Ordering::Release);
+        self.send(Command::Pause(false));
     }
 
     /// Whether the music bed is currently paused.
     pub fn music_is_paused(&self) -> bool {
-        lock(&self.bus).music.is_paused()
+        self.inner.state.paused.load(Ordering::Acquire)
     }
 
     /// Restart the bed from sample 0 — the position clock and every layer rewind
     /// to their loop head. Call this to line the music up with a beat clock.
     pub fn music_reset(&self) {
-        lock(&self.bus).music.reset();
+        let epoch = self.inner.state.resets.fetch_add(1, Ordering::AcqRel) + 1;
+        self.send(Command::Reset(epoch));
     }
 
     /// Frames of music rendered while playing since start or the last
     /// [`music_reset`](Self::music_reset) — the sample-exact musical clock a
     /// beat-locked game derives its beat position from. Holds while paused.
+    /// Read from the newest mixed block.
     pub fn music_position_frames(&self) -> u64 {
-        lock(&self.bus).music.position_frames()
+        self.inner.state.position_frames()
     }
 
     /// Duck the whole bed to `1.0 - depth`, recovering over `release` — a fast
     /// sidechain for stingers or SFX, independent of the (slower) intensity
     /// cross-fade.
     pub fn music_duck(&self, depth: f32, release: std::time::Duration) {
-        lock(&self.bus).music.duck(depth, release);
+        self.send(Command::Duck(depth, release));
     }
 
     // ---- Musical time & quantized scheduling ----
@@ -325,23 +385,35 @@ impl TonoAudio {
     /// to beats/bars. Required for any [`Quantize`] other than
     /// [`Immediate`](Quantize::Immediate).
     pub fn set_music_tempo(&self, bpm: f32, beats_per_bar: u32) {
-        lock(&self.bus).music.set_tempo(bpm, beats_per_bar);
+        let mut registry = lock(&self.inner.registry);
+        registry.tempo = (bpm.max(0.0), beats_per_bar);
+        self.send(Command::Tempo(bpm, beats_per_bar));
+    }
+
+    /// The musical clock on the tempo's grid (0 until a tempo is set).
+    fn music_clock(&self) -> Option<Transport> {
+        let (bpm, beats_per_bar) = lock(&self.inner.registry).tempo;
+        (bpm > 0.0).then(|| {
+            let mut clock = Transport::constant(self.inner.sample_rate, bpm, beats_per_bar);
+            clock.seek_frame(self.music_position_frames());
+            clock
+        })
     }
 
     /// The musical position in beats since the last [`music_reset`](Self::music_reset).
     pub fn music_beats(&self) -> f64 {
-        lock(&self.bus).music.beats()
+        self.music_clock().map_or(0.0, |c| c.position_beats())
     }
 
     /// The musical position in bars since the last [`music_reset`](Self::music_reset).
     pub fn music_bars(&self) -> f64 {
-        lock(&self.bus).music.bars()
+        self.music_clock().map_or(0.0, |c| c.position_bars())
     }
 
     /// Set the intensity on a beat/bar boundary — the quantized counterpart of
     /// [`set_intensity`](Self::set_intensity).
     pub fn set_intensity_at(&self, intensity: f32, quantize: Quantize) {
-        lock(&self.bus).music.set_intensity_at(intensity, quantize);
+        self.send(Command::IntensityAt(intensity, quantize));
     }
 
     /// Fire a stinger on a beat/bar boundary. The stinger is rendered now, on
@@ -359,29 +431,42 @@ impl TonoAudio {
     /// [`transition_to_section`](Self::transition_to_section).
     pub fn add_section(&self, name: impl Into<String>, doc: &SoundDoc) -> usize {
         let mut d = doc.clone();
-        d.sample_rate = self.sample_rate;
-        // Render the section bed off-lock, then hand the buffer in — matches
-        // `music_layer` and keeps the cpal callback's try_lock from missing a
-        // buffer on a runtime section-add.
+        d.sample_rate = self.inner.sample_rate;
         let buffer = LoopBuffer::from_doc(&d);
-        lock(&self.bus).music.add_section_buffer(name, buffer)
+        let name = name.into();
+        let mut registry = lock(&self.inner.registry);
+        let index = registry.sections.len();
+        registry.sections.push(name.clone());
+        self.send(Command::Section(name, buffer));
+        // The first section plays at once; say so before the mixer does.
+        if index == 0 {
+            let current = &self.inner.state.current_section;
+            current
+                .compare_exchange(NO_SECTION, 0, Ordering::AcqRel, Ordering::Acquire)
+                .ok();
+        }
+        index
     }
 
     /// Cross-fade to another section on a beat/bar boundary — horizontal
     /// re-sequencing (swap "explore" for "battle" on the next bar, no mid-phrase
     /// cut).
     pub fn transition_to_section(&self, section: usize, quantize: Quantize) {
-        lock(&self.bus).music.transition_to(section, quantize);
+        self.send(Command::Transition(section, quantize));
     }
 
     /// The section currently sounding, if any.
     pub fn current_section(&self) -> Option<usize> {
-        lock(&self.bus).music.current_section()
+        let current = self.inner.state.current_section.load(Ordering::Acquire);
+        (current != NO_SECTION).then_some(current)
     }
 
     /// Look up a section index by name.
     pub fn section_named(&self, name: &str) -> Option<usize> {
-        lock(&self.bus).music.section_named(name)
+        lock(&self.inner.registry)
+            .sections
+            .iter()
+            .position(|s| s == name)
     }
 
     /// Register a live, playable [`Instrument`] from a factory preset (see
@@ -395,53 +480,54 @@ impl TonoAudio {
 
     /// Register a live, playable instrument from an [`InstrumentDesign`].
     pub fn add_instrument(&self, design: InstrumentDesign) -> Result<InstrumentId, String> {
-        let inst = Instrument::new(design, self.sample_rate).map_err(|e| format!("{e:?}"))?;
-        let mut bus = lock(&self.bus);
-        bus.instruments.push(inst);
-        Ok(InstrumentId(bus.instruments.len() - 1))
+        let inst = Instrument::new(design, self.inner.sample_rate).map_err(|e| format!("{e:?}"))?;
+        let mut registry = lock(&self.inner.registry);
+        let id = registry.instruments;
+        registry.instruments += 1;
+        self.send(Command::Instrument(Box::new(inst)));
+        Ok(InstrumentId(id))
     }
 
     /// Start a note on a registered instrument (velocity 0..1). Polyphonic —
     /// hold several at once.
     pub fn note_on(&self, instrument: InstrumentId, note: Note, velocity: f32) {
-        self.with_instrument(instrument, "note_on", |inst| {
-            inst.note_on(note, velocity);
-        });
+        if self.known_instrument(instrument, "note_on") {
+            self.send(Command::NoteOn(instrument.0, note, velocity));
+        }
     }
 
     /// Release a note on a registered instrument.
     pub fn note_off(&self, instrument: InstrumentId, note: Note) {
-        self.with_instrument(instrument, "note_off", |inst| {
-            inst.note_off(note);
-        });
+        if self.known_instrument(instrument, "note_off") {
+            self.send(Command::NoteOff(instrument.0, note));
+        }
     }
 
     /// Set the pitch bend, in semitones, on a registered instrument (a whammy /
     /// bend-wheel knob; applies to its sounding voices).
     pub fn set_bend(&self, instrument: InstrumentId, semitones: f32) {
-        self.with_instrument(instrument, "set_bend", |inst| inst.set_bend(semitones));
+        if self.known_instrument(instrument, "set_bend") {
+            self.send(Command::Bend(instrument.0, semitones));
+        }
     }
 
-    /// Run `f` on a registered instrument. An unknown id is a caller bug.
-    fn with_instrument(&self, instrument: InstrumentId, op: &str, f: impl FnOnce(&mut Instrument)) {
-        let mut bus = lock(&self.bus);
-        if let Some(inst) = bus.instruments.get_mut(instrument.0) {
-            f(inst);
-        } else {
-            debug_assert!(false, "{op}: unknown instrument {}", instrument.0);
-        }
+    /// Whether `instrument` was registered here. An unknown id is a caller bug.
+    fn known_instrument(&self, instrument: InstrumentId, op: &str) -> bool {
+        let known = instrument.0 < lock(&self.inner.registry).instruments;
+        debug_assert!(known, "{op}: unknown instrument {}", instrument.0);
+        known
     }
 
     /// Set the master output gain applied to the whole bus (SFX + music),
     /// `0.0..=1.0` — a global volume knob. Clamped; applied per sample, so a
     /// change is click-free at the buffer scale.
     pub fn set_master_gain(&self, gain: f32) {
-        lock(&self.bus).master_gain = gain.clamp(0.0, 1.0);
+        self.send(Command::MasterGain(gain.clamp(0.0, 1.0)));
     }
 
     /// The device sample rate the engine renders at.
     pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
+        self.inner.sample_rate
     }
 }
 
@@ -536,439 +622,15 @@ pub struct TonoPlugin;
 
 impl Plugin for TonoPlugin {
     fn build(&self, app: &mut App) {
-        let (bus, sample_rate) = spawn_audio();
-        app.insert_resource(TonoAudio {
-            bus,
-            voices: Arc::default(),
-            sample_rate,
-        })
+        install(app, output::spawn_audio());
+    }
+}
+
+/// Insert the resource and wire the messages that feed it.
+fn install(app: &mut App, audio: TonoAudio) {
+    app.insert_resource(audio)
         .add_message::<PlaySfx>()
         .add_message::<PlayNote>()
         .add_message::<StopNote>()
         .add_systems(Update, (play_queued_sfx, drain_notes));
-    }
-}
-
-/// The mixed audio bus: the SFX/one-shot [`Engine`], an [`AdaptiveMusic`] bed,
-/// and the live [`Instrument`]s, summed to stereo.
-struct GameBus {
-    engine: Engine,
-    music: AdaptiveMusic,
-    instruments: Vec<Instrument>,
-    scratch: Vec<f32>,
-    master_gain: f32,
-}
-
-impl GameBus {
-    fn new(sample_rate: u32) -> Self {
-        GameBus {
-            engine: Engine::new(sample_rate),
-            music: AdaptiveMusic::new(sample_rate),
-            instruments: Vec::new(),
-            scratch: Vec::new(),
-            master_gain: 1.0,
-        }
-    }
-}
-
-impl AudioSource for GameBus {
-    fn fill(&mut self, out: &mut [f32]) -> usize {
-        let n = self.engine.fill(out); // SFX / one-shots (writes the whole buffer)
-        let len = out.len();
-        if self.scratch.len() < len {
-            self.scratch.resize(len, 0.0);
-        }
-        // Add the music bed, then each live instrument, through the scratch.
-        self.music.fill(&mut self.scratch[..len]);
-        for (o, &s) in out.iter_mut().zip(self.scratch[..len].iter()) {
-            *o += s;
-        }
-        for inst in &mut self.instruments {
-            inst.fill(&mut self.scratch[..len]);
-            for (o, &s) in out.iter_mut().zip(self.scratch[..len].iter()) {
-                *o += s;
-            }
-        }
-        // Master gain + clamp.
-        let g = self.master_gain;
-        for o in out.iter_mut() {
-            *o = (*o * g).clamp(-1.0, 1.0);
-        }
-        n
-    }
-}
-
-/// Spawn the audio thread (it owns the `cpal` stream for the process's life) and
-/// return a shared handle to the bus. Never fails — a missing device degrades to
-/// a silent (undrained) bus.
-fn spawn_audio() -> (Arc<Mutex<GameBus>>, u32) {
-    let fallback = || {
-        let bus = Arc::new(Mutex::new(GameBus::new(FALLBACK_SAMPLE_RATE)));
-        (bus, FALLBACK_SAMPLE_RATE)
-    };
-    let (tx, rx) = mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("bevy_tono-audio".into())
-        .spawn(move || match build_stream() {
-            Ok((stream, bus, sr)) => {
-                tx.send((bus, sr)).ok();
-                let _stream = stream; // hold the stream open for the thread's life
-                loop {
-                    std::thread::park();
-                }
-            }
-            Err(e) => {
-                eprintln!("bevy_tono: audio disabled ({e})");
-                tx.send(fallback()).ok();
-            }
-        });
-    if spawned.is_err() {
-        return fallback();
-    }
-    rx.recv().unwrap_or_else(|_| fallback())
-}
-
-/// Build the output stream + bus on the audio thread.
-fn build_stream() -> anyhow::Result<(cpal::Stream, Arc<Mutex<GameBus>>, u32)> {
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("no default output device"))?;
-    let supported = device.default_output_config()?;
-    let sample_rate = supported.sample_rate().0;
-    let channels = supported.channels() as usize;
-    let sample_format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.into();
-
-    let bus = Arc::new(Mutex::new(GameBus::new(sample_rate)));
-    let cb_bus = bus.clone();
-    let mut scratch = Vec::<f32>::new();
-    let err_fn = |e| eprintln!("bevy_tono: stream error: {e}");
-
-    let stream = match sample_format {
-        cpal::SampleFormat::F32 => device.build_output_stream(
-            &config,
-            move |data: &mut [f32], _| fill_output(&cb_bus, data, channels, &mut scratch),
-            err_fn,
-            None,
-        )?,
-        other => anyhow::bail!("unsupported output sample format {other:?} (needs f32)"),
-    };
-    stream.play()?;
-    Ok((stream, bus, sample_rate))
-}
-
-/// The `cpal` callback body: render the bus (never blocking) and lay it into the
-/// device's channel layout.
-fn fill_output(
-    bus: &Arc<Mutex<GameBus>>,
-    data: &mut [f32],
-    channels: usize,
-    scratch: &mut Vec<f32>,
-) {
-    let frames = data.len() / channels.max(1);
-    if scratch.len() < frames * 2 {
-        scratch.resize(frames * 2, 0.0);
-    }
-    let st = &mut scratch[..frames * 2];
-    match bus.try_lock() {
-        Ok(mut b) => {
-            b.fill(st);
-        }
-        Err(_) => st.fill(0.0),
-    }
-    for f in 0..frames {
-        let (l, r) = (st[f * 2], st[f * 2 + 1]);
-        let base = f * channels;
-        if channels == 1 {
-            data[base] = 0.5 * (l + r);
-        } else {
-            data[base] = l;
-            data[base + 1] = r;
-            for c in 2..channels {
-                data[base + c] = 0.0;
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn blip() -> SoundDoc {
-        serde_json::from_str(
-            r#"{ "name":"blip", "duration":0.1, "engine":2, "root": { "type":"mul", "inputs": [
-                { "type":"sine", "freq":880 },
-                { "type":"env", "a":0.002, "d":0.05, "s":0.0, "r":0.02 } ] } }"#,
-        )
-        .unwrap()
-    }
-
-    fn peak(out: &[f32]) -> f32 {
-        out.iter().fold(0.0f32, |m, &x| m.max(x.abs()))
-    }
-
-    #[test]
-    fn bus_plays_a_registered_sfx() {
-        let mut bus = GameBus::new(48_000);
-        let patch = bus.engine.load(&blip());
-        bus.engine.play(patch);
-        let mut out = vec![0.0f32; 512 * 2];
-        bus.fill(&mut out);
-        assert!(peak(&out) > 0.0, "the SFX sounds through the bus");
-    }
-
-    #[test]
-    fn bus_mixes_music_under_sfx() {
-        let mut bus = GameBus::new(48_000);
-        bus.music.add_layer(LoopBuffer::from_doc(&blip()), 0.0); // always-on stem
-        bus.music.set_intensity(1.0);
-        let mut out = vec![0.0f32; 512 * 2];
-        bus.fill(&mut out);
-        assert!(out.iter().any(|&x| x != 0.0), "music bed sounds");
-    }
-
-    #[test]
-    fn master_gain_scales_and_silences() {
-        let mut bus = GameBus::new(48_000);
-        let patch = bus.engine.load(&blip());
-        bus.engine.play(patch);
-        bus.master_gain = 0.0;
-        let mut out = vec![0.0f32; 512 * 2];
-        bus.fill(&mut out);
-        assert_eq!(peak(&out), 0.0, "master gain 0 mutes the bus");
-    }
-
-    #[test]
-    fn ecs_layer_plays_sfx_and_beds_a_song() {
-        use tono_core::dsl::{Adsr, SeqWave};
-        use tono_core::song::{Song, note};
-
-        let (mut app, audio) = audio_app();
-
-        // PlaySfx: a registered sound fired via the message queue is drained and
-        // played by the plugin's system on update — without panicking.
-        let sound = audio.register(&blip());
-        app.world_mut()
-            .write_message(PlaySfx::new(sound).with_gain(0.7));
-        app.update();
-
-        // play_song: a Song compiles and beds as a looping music layer.
-        let mut song = Song::new("bg", 100.0);
-        song.add_track(
-            "bass",
-            SeqWave::Bass,
-            Adsr {
-                a: 0.005,
-                d: 0.1,
-                s: 0.9,
-                r: 0.1,
-                punch: 0.0,
-            },
-        );
-        song.add_pattern("r", 1, vec![note(0, 4, "C2"), note(8, 4, "G2")]);
-        song.arrange("bass", "r", 0);
-        assert!(audio.play_song(&song).is_ok(), "the song compiles and beds");
-    }
-
-    #[test]
-    fn live_instrument_plays_a_held_note() {
-        let (mut app, audio) = audio_app();
-
-        // Register a preset instrument and play a note by message.
-        let inst = audio.preset("vibrato_lead").expect("the preset exists");
-        app.world_mut()
-            .write_message(PlayNote::new(inst, Note::C4).with_velocity(0.9));
-        app.update(); // drain_notes fires note_on
-
-        // A held note sustains — pull a few buffers and confirm it sounds.
-        let mut loudest = 0.0f32;
-        for _ in 0..8 {
-            let mut out = vec![0.0f32; 512 * 2];
-            lock(&audio.bus).fill(&mut out);
-            loudest = loudest.max(peak(&out));
-        }
-        assert!(loudest > 0.0, "the held instrument note sounds");
-    }
-
-    #[test]
-    fn review_grades_a_rendered_doc_offline() {
-        use crate::review::{self, Archetype, AuditItem, Status};
-
-        let mut doc = blip();
-        doc.sample_rate = 48_000;
-
-        // A single doc renders + grades (no device) to a Review with findings.
-        let r = review::grade(&doc, Some(Archetype::Ui));
-        assert!(!r.findings.is_empty(), "the review produced findings");
-
-        // The batch API pairs each name with its review; the gate predicate
-        // reflects the worst grade in the set.
-        let items = [AuditItem {
-            name: "blip",
-            doc: &doc,
-            archetype: Some(Archetype::Ui),
-        }];
-        let reviews = review::audit(&items);
-        assert_eq!(reviews.len(), 1);
-        assert_eq!(reviews[0].0, "blip");
-        assert_eq!(
-            review::any_failed(&reviews),
-            reviews[0].1.grade == Status::Fail
-        );
-    }
-
-    fn audio_app() -> (App, TonoAudio) {
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins).add_plugins(TonoPlugin);
-        let audio = app.world().resource::<TonoAudio>().clone();
-        (app, audio)
-    }
-
-    #[test]
-    fn transport_position_pause_and_reset() {
-        let (_app, audio) = audio_app();
-        audio.music_layer(&blip(), 0.0); // an always-on stem so the clock advances
-
-        assert_eq!(audio.music_position_frames(), 0);
-        assert!(!audio.music_is_paused());
-
-        // No audio device in tests — advance the bed by filling the bus directly.
-        lock(&audio.bus).fill(&mut vec![0.0f32; 256 * 2]);
-        assert_eq!(audio.music_position_frames(), 256, "the clock advances");
-
-        audio.music_pause();
-        assert!(audio.music_is_paused());
-        lock(&audio.bus).fill(&mut vec![0.0f32; 256 * 2]);
-        assert_eq!(
-            audio.music_position_frames(),
-            256,
-            "the clock holds while paused"
-        );
-
-        audio.music_resume();
-        audio.music_reset();
-        assert_eq!(audio.music_position_frames(), 0, "reset zeroes the clock");
-        // Transport-only calls stay callable without a device.
-        audio.music_duck(0.5, std::time::Duration::from_millis(180));
-    }
-
-    #[test]
-    fn tempo_beats_and_sections() {
-        let (_app, audio) = audio_app();
-
-        audio.set_music_tempo(120.0, 4);
-        assert_eq!(audio.music_beats(), 0.0);
-        assert_eq!(audio.music_bars(), 0.0);
-
-        // Sections: first added plays; lookups resolve by name and index.
-        let explore = audio.add_section("explore", &blip());
-        let battle = audio.add_section("battle", &blip());
-        assert_eq!((explore, battle), (0, 1));
-        assert_eq!(audio.current_section(), Some(0), "the first section plays");
-        assert_eq!(audio.section_named("battle"), Some(1));
-        assert_eq!(audio.section_named("nope"), None);
-
-        // Quantized scheduling is callable and doesn't panic (the scheduling
-        // logic itself is covered in tono-core).
-        audio.transition_to_section(battle, Quantize::Bar);
-        audio.set_intensity_at(1.0, Quantize::Beat);
-        audio.stinger_at(&blip(), Quantize::Beat);
-    }
-
-    fn long_phrase() -> SoundDoc {
-        serde_json::from_str(
-            r#"{ "name":"phrase", "duration":12.0, "engine":2, "root": { "type":"mul", "inputs": [
-                { "type":"sawtooth", "freq":220 },
-                { "type":"env", "a":0.01, "d":2.0, "s":0.6, "r":1.0 } ] } }"#,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn play_renders_outside_the_bus_lock() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
-
-        let (_app, audio) = audio_app();
-        let phrase = audio.register(&long_phrase());
-
-        // Stand in for the cpal callback: try_lock and fill, timing the
-        // longest stretch the bus was unavailable.
-        let done = Arc::new(AtomicBool::new(false));
-        let callback = {
-            let (bus, done) = (audio.bus.clone(), done.clone());
-            std::thread::spawn(move || {
-                let mut out = vec![0.0f32; 256 * 2];
-                let mut blocked_since: Option<Instant> = None;
-                let mut longest = Duration::ZERO;
-                while !done.load(Ordering::Relaxed) {
-                    match bus.try_lock() {
-                        Ok(mut b) => {
-                            b.fill(&mut out);
-                            if let Some(t) = blocked_since.take() {
-                                longest = longest.max(t.elapsed());
-                            }
-                        }
-                        Err(_) => {
-                            blocked_since.get_or_insert_with(Instant::now);
-                        }
-                    }
-                    std::thread::yield_now();
-                }
-                longest
-            })
-        };
-
-        let start = Instant::now();
-        let voice = audio.play(phrase); // first play: renders 12 s of audio
-        let render = start.elapsed();
-        done.store(true, Ordering::Relaxed);
-        let longest = callback.join().unwrap();
-
-        assert!(lock(&audio.bus).engine.is_active(voice.0));
-        assert!(
-            longest < render / 2,
-            "the bus was locked for {longest:?} of a {render:?} play"
-        );
-    }
-
-    #[test]
-    fn a_replayed_sound_reuses_its_render() {
-        let (_app, audio) = audio_app();
-        let blip_sound = audio.register(&blip());
-        assert!(lock(&audio.voices).is_empty());
-        audio.play(blip_sound);
-        audio.play_with_gain(blip_sound, 0.5);
-        audio.play_looping(blip_sound);
-        let voices = lock(&audio.voices);
-        assert_eq!(voices.len(), 1, "one render per sound");
-        assert!(voices[&blip_sound.0].is_rendered());
-        assert_eq!(lock(&audio.bus).engine.active(), 3);
-    }
-
-    #[test]
-    fn a_worker_rendered_stinger_fires_on_its_beat() {
-        let (_app, audio) = audio_app();
-        audio.set_music_tempo(120.0, 4); // a beat every 0.5 s
-        let beat = audio.music_beats().floor() as u64 + 2;
-
-        let worker = audio.clone();
-        let stinger = std::thread::spawn(move || worker.render_stinger(&blip()))
-            .join()
-            .unwrap();
-        audio.play_stinger_at(&stinger, Quantize::AtBeat(beat));
-        audio.play_stinger_at(&stinger, Quantize::AtBeat(beat + 1));
-
-        let frames_per_beat = audio.sample_rate() as usize / 2;
-        let fired = |audio: &TonoAudio| lock(&audio.bus).music.active_stingers();
-        assert_eq!(fired(&audio), 0, "waiting for the beat");
-        // No device in tests: advance the bed by filling the bus directly.
-        let mut out = vec![0.0f32; (beat as usize * frames_per_beat + 64) * 2];
-        lock(&audio.bus).fill(&mut out);
-        assert_eq!(fired(&audio), 1, "the first stinger fired on its beat");
-        audio.play_stinger(&stinger); // the same render again, now
-        assert_eq!(fired(&audio), 2);
-    }
 }

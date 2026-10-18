@@ -1,0 +1,507 @@
+use super::*;
+use tono_core::adaptive::AdaptiveMusic;
+use tono_core::runtime::{AudioSource, InstanceHandle, Tween};
+
+fn doc(json: &str) -> SoundDoc {
+    serde_json::from_str(json).unwrap()
+}
+
+fn blip() -> SoundDoc {
+    doc(
+        r#"{ "name":"blip", "duration":0.1, "engine":2, "root": { "type":"mul", "inputs": [
+            { "type":"sine", "freq":880 },
+            { "type":"env", "a":0.002, "d":0.05, "s":0.0, "r":0.02 } ] } }"#,
+    )
+}
+
+fn pad() -> SoundDoc {
+    doc(
+        r#"{ "name":"pad", "duration":0.5, "engine":2, "root": { "type":"chain", "stages": [
+            { "type":"sawtooth", "freq":110 },
+            { "type":"lowpass", "cutoff":900, "q":0.5 } ] } }"#,
+    )
+}
+
+fn long_phrase() -> SoundDoc {
+    doc(
+        r#"{ "name":"phrase", "duration":12.0, "engine":2, "root": { "type":"mul", "inputs": [
+            { "type":"sawtooth", "freq":220 },
+            { "type":"env", "a":0.01, "d":2.0, "s":0.6, "r":1.0 } ] } }"#,
+    )
+}
+
+fn peak(out: &[f32]) -> f32 {
+    out.iter().fold(0.0f32, |m, &x| m.max(x.abs()))
+}
+
+/// A resource and its mixer with no device or thread: the test pulls blocks.
+fn manual() -> (TonoAudio, Mixer) {
+    TonoAudio::with_mixer(48_000)
+}
+
+/// The plugin's messages and systems over a manual mixer.
+fn audio_app() -> (App, TonoAudio, Mixer) {
+    let (audio, mixer) = manual();
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins);
+    install(&mut app, audio.clone());
+    (app, audio, mixer)
+}
+
+/// Mix `frames` frames in one block.
+fn pull(mixer: &mut Mixer, frames: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; frames * 2];
+    mixer.fill(&mut out);
+    out
+}
+
+fn bits(out: &[f32]) -> Vec<u32> {
+    out.iter().map(|x| x.to_bits()).collect()
+}
+
+/// The 0.6 bus — engine, music and instruments summed under a lock — kept
+/// here as the reference the mixer must match sample for sample.
+struct OldBus {
+    engine: Engine,
+    music: AdaptiveMusic,
+    scratch: Vec<f32>,
+    master_gain: f32,
+}
+
+impl OldBus {
+    fn new() -> Self {
+        OldBus {
+            engine: Engine::new(48_000),
+            music: AdaptiveMusic::new(48_000),
+            scratch: Vec::new(),
+            master_gain: 1.0,
+        }
+    }
+
+    fn at_rate(doc: &SoundDoc) -> SoundDoc {
+        let mut d = doc.clone();
+        d.sample_rate = 48_000;
+        d
+    }
+
+    fn play(&mut self, patch: PatchId, how: Spawn, gain: f32) -> InstanceHandle {
+        let mut voice = self.engine.prepare(patch).unwrap();
+        voice.render();
+        let h = self.engine.spawn_prepared(voice, how);
+        if gain != 1.0 {
+            self.engine.set_gain(h, gain, Tween::IMMEDIATE);
+        }
+        h
+    }
+
+    fn fill(&mut self, out: &mut [f32]) {
+        self.engine.fill(out);
+        let len = out.len();
+        if self.scratch.len() < len {
+            self.scratch.resize(len, 0.0);
+        }
+        self.music.fill(&mut self.scratch[..len]);
+        for (o, &s) in out.iter_mut().zip(self.scratch[..len].iter()) {
+            *o += s;
+        }
+        let g = self.master_gain;
+        for o in out.iter_mut() {
+            *o = (*o * g).clamp(-1.0, 1.0);
+        }
+    }
+}
+
+#[test]
+fn the_mixer_matches_the_old_bus_sample_for_sample() {
+    let (audio, mut mixer) = manual();
+    let mut old = OldBus::new();
+    let compare = |mixer: &mut Mixer, old: &mut OldBus, blocks: usize| {
+        for n in 0..blocks {
+            let frames = 128 + 61 * (n % 5); // uneven block sizes
+            let new = pull(mixer, frames);
+            let mut reference = vec![0.0f32; frames * 2];
+            old.fill(&mut reference);
+            assert_eq!(bits(&new), bits(&reference), "block {n}");
+        }
+    };
+
+    let sound = audio.register(&blip());
+    let patch = old.engine.load(&OldBus::at_rate(&blip()));
+    audio.music_layer(&pad(), 0.0);
+    old.music
+        .add_layer(LoopBuffer::from_doc(&OldBus::at_rate(&pad())), 0.0);
+    audio.music_layer(&blip(), 0.5);
+    old.music
+        .add_layer(LoopBuffer::from_doc(&OldBus::at_rate(&blip())), 0.5);
+    audio.set_music_tempo(150.0, 4);
+    old.music.set_tempo(150.0, 4);
+    compare(&mut mixer, &mut old, 4);
+
+    audio.play(sound);
+    old.play(patch, Spawn::default(), 1.0);
+    audio.play_with_gain(sound, 0.4);
+    old.play(patch, Spawn::default(), 0.4);
+    let looping = Spawn {
+        looping: true,
+        ..Spawn::default()
+    };
+    let bed = audio.play_looping(sound);
+    let h = old.play(patch, looping, 1.0);
+    audio.set_intensity(0.8);
+    old.music.set_intensity(0.8);
+    audio.stinger_at(&blip(), Quantize::Beat);
+    old.music
+        .stinger_at(&OldBus::at_rate(&blip()), Quantize::Beat);
+    compare(&mut mixer, &mut old, 40);
+
+    audio.add_section("a", &pad());
+    old.music
+        .add_section_buffer("a", LoopBuffer::from_doc(&OldBus::at_rate(&pad())));
+    audio.add_section("b", &blip());
+    old.music
+        .add_section_buffer("b", LoopBuffer::from_doc(&OldBus::at_rate(&blip())));
+    audio.transition_to_section(1, Quantize::Bar);
+    old.music.transition_to(1, Quantize::Bar);
+    audio.music_duck(0.5, std::time::Duration::from_millis(120));
+    old.music.duck(0.5, std::time::Duration::from_millis(120));
+    audio.set_gain(bed, 0.3);
+    old.engine.set_gain(h, 0.3, Tween::ms(20.0, 48_000));
+    compare(&mut mixer, &mut old, 80);
+
+    audio.stop(bed);
+    old.engine.stop(h, Tween::ms(8.0, 48_000));
+    audio.music_pause();
+    old.music.pause();
+    compare(&mut mixer, &mut old, 10);
+    audio.music_resume();
+    old.music.resume();
+    audio.music_reset();
+    old.music.reset();
+    compare(&mut mixer, &mut old, 20);
+    audio.set_master_gain(0.5);
+    old.master_gain = 0.5;
+    compare(&mut mixer, &mut old, 5);
+}
+
+#[test]
+fn bus_plays_a_registered_sfx() {
+    let (audio, mut mixer) = manual();
+    let sound = audio.register(&blip());
+    audio.play(sound);
+    assert!(peak(&pull(&mut mixer, 512)) > 0.0, "the SFX sounds");
+}
+
+#[test]
+fn master_gain_silences() {
+    let (audio, mut mixer) = manual();
+    let sound = audio.register(&blip());
+    audio.set_master_gain(0.0);
+    audio.play(sound);
+    assert_eq!(
+        peak(&pull(&mut mixer, 512)),
+        0.0,
+        "master gain 0 mutes the bus"
+    );
+}
+
+#[test]
+fn ecs_layer_plays_sfx_and_beds_a_song() {
+    use tono_core::dsl::{Adsr, SeqWave};
+    use tono_core::song::{Song, note};
+
+    let (mut app, audio, mut mixer) = audio_app();
+
+    // PlaySfx: a registered sound fired via the message queue is drained and
+    // played by the plugin's system on update.
+    let sound = audio.register(&blip());
+    app.world_mut()
+        .write_message(PlaySfx::new(sound).with_gain(0.7));
+    app.update();
+    pull(&mut mixer, 64);
+    assert_eq!(mixer.engine.active(), 1, "the message reached the mixer");
+
+    // play_song: a Song compiles and beds as a looping music layer.
+    let mut song = Song::new("bg", 100.0);
+    song.add_track(
+        "bass",
+        SeqWave::Bass,
+        Adsr {
+            a: 0.005,
+            d: 0.1,
+            s: 0.9,
+            r: 0.1,
+            punch: 0.0,
+        },
+    );
+    song.add_pattern("r", 1, vec![note(0, 4, "C2"), note(8, 4, "G2")]);
+    song.arrange("bass", "r", 0);
+    assert!(audio.play_song(&song).is_ok(), "the song compiles and beds");
+}
+
+#[test]
+fn live_instrument_plays_a_held_note() {
+    let (mut app, audio, mut mixer) = audio_app();
+
+    // Register a preset instrument and play a note by message.
+    let inst = audio.preset("vibrato_lead").expect("the preset exists");
+    app.world_mut()
+        .write_message(PlayNote::new(inst, Note::C4).with_velocity(0.9));
+    app.update(); // drain_notes fires note_on
+
+    // A held note sustains — pull a few buffers and confirm it sounds.
+    let loudest = (0..8)
+        .map(|_| peak(&pull(&mut mixer, 512)))
+        .fold(0.0, f32::max);
+    assert!(loudest > 0.0, "the held instrument note sounds");
+}
+
+#[test]
+fn review_grades_a_rendered_doc_offline() {
+    use crate::review::{self, Archetype, AuditItem, Status};
+
+    let mut doc = blip();
+    doc.sample_rate = 48_000;
+
+    // A single doc renders + grades (no device) to a Review with findings.
+    let r = review::grade(&doc, Some(Archetype::Ui));
+    assert!(!r.findings.is_empty(), "the review produced findings");
+
+    // The batch API pairs each name with its review; the gate predicate
+    // reflects the worst grade in the set.
+    let items = [AuditItem {
+        name: "blip",
+        doc: &doc,
+        archetype: Some(Archetype::Ui),
+    }];
+    let reviews = review::audit(&items);
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].0, "blip");
+    assert_eq!(
+        review::any_failed(&reviews),
+        reviews[0].1.grade == Status::Fail
+    );
+}
+
+#[test]
+fn transport_position_pause_and_reset() {
+    let (audio, mut mixer) = manual();
+    audio.music_layer(&blip(), 0.0);
+
+    assert_eq!(audio.music_position_frames(), 0);
+    assert!(!audio.music_is_paused());
+
+    pull(&mut mixer, 256);
+    assert_eq!(audio.music_position_frames(), 256, "the clock advances");
+
+    audio.music_pause();
+    assert!(audio.music_is_paused(), "the pause reads back at once");
+    pull(&mut mixer, 256);
+    assert_eq!(
+        audio.music_position_frames(),
+        256,
+        "the clock holds while paused"
+    );
+
+    audio.music_resume();
+    audio.music_reset();
+    assert_eq!(audio.music_position_frames(), 0, "reset reads back at once");
+    pull(&mut mixer, 128);
+    assert_eq!(audio.music_position_frames(), 128, "and counts from zero");
+    audio.music_duck(0.5, std::time::Duration::from_millis(180));
+}
+
+#[test]
+fn tempo_beats_and_sections() {
+    let (audio, mut mixer) = manual();
+
+    audio.set_music_tempo(120.0, 4);
+    assert_eq!(audio.music_beats(), 0.0);
+    assert_eq!(audio.music_bars(), 0.0);
+    pull(&mut mixer, 48_000); // a second at 120 bpm: two beats
+    assert_eq!(audio.music_beats(), 2.0);
+    assert_eq!(audio.music_bars(), 0.5);
+
+    // Sections: first added plays; lookups resolve by name and index.
+    let explore = audio.add_section("explore", &blip());
+    let battle = audio.add_section("battle", &blip());
+    assert_eq!((explore, battle), (0, 1));
+    assert_eq!(audio.current_section(), Some(0), "the first section plays");
+    assert_eq!(audio.section_named("battle"), Some(1));
+    assert_eq!(audio.section_named("nope"), None);
+
+    audio.transition_to_section(battle, Quantize::Bar);
+    audio.set_intensity_at(1.0, Quantize::Beat);
+    audio.stinger_at(&blip(), Quantize::Beat);
+    pull(&mut mixer, 512);
+    assert_eq!(audio.current_section(), Some(0), "waits for the bar");
+    pull(&mut mixer, 48_000 + 4_000); // past the bar line and the fade
+    assert_eq!(audio.current_section(), Some(1), "the swap reads back");
+}
+
+#[test]
+fn play_renders_outside_the_mixer() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    let (audio, mut mixer) = manual();
+    let phrase = audio.register(&long_phrase());
+
+    // Stand in for the audio callback: keep mixing while the game thread
+    // renders a 12 s phrase, timing the longest block.
+    let done = Arc::new(AtomicBool::new(false));
+    let callback = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let mut longest = Duration::ZERO;
+            while !done.load(Ordering::Relaxed) {
+                let t = Instant::now();
+                pull(&mut mixer, 256);
+                longest = longest.max(t.elapsed());
+            }
+            (longest, mixer)
+        })
+    };
+
+    let start = Instant::now();
+    audio.play(phrase); // first play: renders 12 s of audio
+    let render = start.elapsed();
+    std::thread::sleep(Duration::from_millis(20));
+    done.store(true, Ordering::Relaxed);
+    let (longest, mut mixer) = callback.join().unwrap();
+    pull(&mut mixer, 64);
+
+    assert_eq!(mixer.engine.active(), 1, "the phrase plays");
+    assert!(
+        longest < render / 2,
+        "a block took {longest:?} during a {render:?} render"
+    );
+}
+
+#[test]
+fn the_mixer_never_waits_for_game_side_locks() {
+    let (audio, mut mixer) = manual();
+    let sound = audio.register(&blip());
+    audio.play(sound);
+    // Hold every lock the game side has while the "callback" mixes.
+    let _registry = lock(&audio.inner.registry);
+    let _voices = lock(&audio.inner.voices);
+    let mixed = std::thread::scope(|s| s.spawn(|| peak(&pull(&mut mixer, 512))).join());
+    assert!(mixed.unwrap() > 0.0, "the block mixed with the locks held");
+}
+
+#[test]
+fn a_replayed_sound_reuses_its_render() {
+    let (audio, mut mixer) = manual();
+    let blip_sound = audio.register(&blip());
+    assert!(lock(&audio.inner.voices).is_empty());
+    audio.play(blip_sound);
+    audio.play_with_gain(blip_sound, 0.5);
+    audio.play_looping(blip_sound);
+    {
+        let voices = lock(&audio.inner.voices);
+        assert_eq!(voices.len(), 1, "one render per sound");
+        assert!(voices[&blip_sound.0].is_rendered());
+    }
+    pull(&mut mixer, 64);
+    assert_eq!(mixer.engine.active(), 3);
+}
+
+#[test]
+fn a_worker_rendered_stinger_fires_on_its_beat() {
+    let (audio, mut mixer) = manual();
+    audio.set_music_tempo(120.0, 4); // a beat every 0.5 s
+    let beat = audio.music_beats().floor() as u64 + 2;
+
+    let worker = audio.clone();
+    let stinger = std::thread::spawn(move || worker.render_stinger(&blip()))
+        .join()
+        .unwrap();
+    audio.play_stinger_at(&stinger, Quantize::AtBeat(beat));
+    audio.play_stinger_at(&stinger, Quantize::AtBeat(beat + 1));
+
+    let frames_per_beat = audio.sample_rate() as usize / 2;
+    pull(&mut mixer, 64);
+    assert_eq!(mixer.music.active_stingers(), 0, "waiting for the beat");
+    pull(&mut mixer, beat as usize * frames_per_beat);
+    assert_eq!(mixer.music.active_stingers(), 1, "fired on its beat");
+    audio.play_stinger(&stinger); // the same render again, now
+    pull(&mut mixer, 1);
+    assert_eq!(mixer.music.active_stingers(), 2);
+}
+
+#[test]
+fn the_headless_drain_keeps_the_clock_moving() {
+    use std::time::{Duration, Instant};
+
+    let (audio, mut mixer) = manual();
+    audio.set_music_tempo(120.0, 4);
+    let mut drain = output::Drain::new(48_000);
+    let mut buffer = vec![0.0f32; 1024];
+    let start = Instant::now();
+    drain.catch_up(start, &mut mixer, &mut buffer);
+    drain.catch_up(start + Duration::from_millis(250), &mut mixer, &mut buffer);
+    assert_eq!(audio.music_position_frames(), 12_000, "a quarter second");
+    assert_eq!(audio.music_beats(), 0.5);
+    // A long stall skips ahead instead of mixing it all at once.
+    drain.catch_up(start + Duration::from_secs(30), &mut mixer, &mut buffer);
+    assert_eq!(
+        audio.music_position_frames(),
+        60_000,
+        "at most a second more"
+    );
+}
+
+#[test]
+fn integer_devices_get_the_same_mix() {
+    let render = |sample: fn(&mut Mixer, &mut [f32])| {
+        let (audio, mut mixer) = manual();
+        let sound = audio.register(&blip());
+        audio.play(sound);
+        let mut stereo = vec![0.0f32; 512 * 2];
+        sample(&mut mixer, &mut stereo);
+        stereo
+    };
+    let float = render(|mixer, stereo| mixer.fill(stereo));
+    let wide = render(|mixer, stereo| {
+        // A three-channel i16 device, served in 64-frame chunks.
+        let mut data = vec![0i16; 512 * 3];
+        let mut scratch = vec![0.0f32; 64 * 2];
+        output::write_device(mixer, &mut data, 3, &mut scratch);
+        for (lr, frame) in stereo.chunks_exact_mut(2).zip(data.chunks_exact(3)) {
+            assert_eq!(frame[2], 0, "extra channels are silent");
+            lr[0] = frame[0] as f32 / i16::MAX as f32;
+            lr[1] = frame[1] as f32 / i16::MAX as f32;
+        }
+    });
+    let mono = render(|mixer, stereo| {
+        let mut data = vec![0u16; 512];
+        let mut scratch = vec![0.0f32; 512 * 2];
+        output::write_device(mixer, &mut data, 1, &mut scratch);
+        for (lr, &m) in stereo.chunks_exact_mut(2).zip(&data) {
+            let v = (m as f32 - 32_768.0) / 32_768.0;
+            lr[0] = v;
+            lr[1] = v;
+        }
+    });
+    assert!(peak(&float) > 0.1);
+    for (a, b) in float.iter().zip(&wide) {
+        assert!((a - b).abs() < 1e-3, "i16 tracks f32");
+    }
+    for (pair, b) in float.chunks_exact(2).zip(mono.chunks_exact(2)) {
+        assert!(
+            (0.5 * (pair[0] + pair[1]) - b[0]).abs() < 1e-3,
+            "u16 mono is the mid"
+        );
+    }
+}
+
+#[test]
+fn the_plugin_starts_with_or_without_a_device() {
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins).add_plugins(TonoPlugin);
+    app.update();
+    let audio = app.world().resource::<TonoAudio>().clone();
+    let sound = audio.register(&blip());
+    audio.play(sound);
+    assert!(audio.sample_rate() > 0);
+}
