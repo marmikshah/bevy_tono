@@ -849,3 +849,59 @@ fn the_voice_cap_is_respected_by_both_kinds_of_voice() {
     assert_eq!(mixer.engine.active(), 3);
     assert_eq!(mixer.sampled.len(), 2, "one of the earlier ones made way");
 }
+
+#[test]
+fn beds_keep_playing_through_music_pause_and_reset() {
+    use std::time::Duration;
+
+    let (audio, mut mixer) = manual();
+    audio.music_layer(&pad(), 0.0);
+    let sound = audio.register(&pad());
+    let bed = audio.play_looping(sound);
+    let wind = audio.play_with(
+        sound,
+        Play {
+            rate: 0.8,
+            looping: true,
+            ..Play::default()
+        },
+    );
+    audio.set_levels(bed, [0.0, 0.6], Duration::from_millis(20));
+    audio.set_levels(wind, [0.0, 0.3], Duration::from_millis(20));
+    pull(&mut mixer, 2_000);
+
+    audio.music_pause();
+    audio.music_reset();
+    for _ in 0..10 {
+        let out = pull(&mut mixer, 4_800);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        let right: Vec<f32> = out.iter().skip(1).step_by(2).copied().collect();
+        assert_eq!(peak(&left), 0.0, "the levels put both beds hard right");
+        assert!(
+            peak(&right) > 0.05,
+            "the beds play on with the music paused"
+        );
+    }
+    assert_eq!(audio.music_position_frames(), 0, "the music clock held");
+
+    // Levels slew rather than jump, and both sides can sound.
+    audio.set_levels(bed, [0.5, 0.25], Duration::from_millis(100));
+    let slewing = pull(&mut mixer, 480);
+    let left: Vec<f32> = slewing.iter().step_by(2).copied().collect();
+    assert!(
+        peak(&left[..48]) < peak(&left[400..]),
+        "the left side fades in"
+    );
+}
+
+#[test]
+fn levels_map_onto_gain_and_balance() {
+    for [l, r] in [[1.0, 1.0], [0.6, 0.2], [0.1, 0.9], [0.0, 0.4], [0.0, 0.0]] {
+        let (g, pan) = mixer::gain_and_pan(l, r);
+        let (lg, rg) = mixer::balance(pan);
+        assert!(
+            (g * lg - l).abs() < 1e-6 && (g * rg - r).abs() < 1e-6,
+            "{l} {r}"
+        );
+    }
+}
