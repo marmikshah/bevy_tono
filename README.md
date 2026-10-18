@@ -92,29 +92,34 @@ lock-free queue and reads the music clock, section and pause state back from
 atomics, so a game-thread call never blocks or drops output. Every render
 happens on the calling thread before the command is sent, so a long one-shot
 or stinger never gaps the music. A render still costs the calling thread its
-time: `prewarm` a sound, or call `render_stinger` on a worker (`TonoAudio` is
-`Clone`). f32, i16 and u16 devices are supported. With no audio device the
+time: `prewarm` a sound (one background worker renders them in turn), or call
+`render_stinger` on a worker (`TonoAudio` is `Clone`). f32, i16 and u16 devices are supported. With no audio device the
 mixer drains in real time into silence, so beats and quantized changes still
 work headless.
 
 ## Using it in a game
 
-Options go in a `TonoConfig` resource inserted before the plugin; both are off
-by default:
+Options go in a `TonoConfig` resource inserted before the plugin; without one
+everything is off and the output is as before:
 
 ```rust
 app.insert_resource(TonoConfig {
     limiter: Some(Limiter::default()),   // a peak limiter on the final mix
-    pause_music_on_focus_loss: true,     // hold the music while unfocused
+    pause_music_on_focus_loss: true,     // fade out and hold the music while unfocused
+    focus_fade: Duration::from_millis(45), // that fade (the default)
+    output: Output::Headless,            // no device: captures, CI, tests
 })
 .add_plugins(TonoPlugin);
 ```
+
+`Output::Headless` never opens a device; the same mixer drains in real time,
+so the music clock, beats and quantized changes work as with one.
 
 Per-play controls, variation and a voice cap:
 
 ```rust
 let step = audio.register_with(&doc, Variation { pitch: 0.03, pan: 0.2, level: 0.1 });
-audio.prewarm(step);                     // render on a worker, not on first play
+audio.prewarm(step);                     // render on the prewarm worker, ready for any rate
 audio.set_max_voices(24);                // the engine's cap: lowest priority, oldest, goes first
 
 audio.play_with(step, Play {
@@ -135,6 +140,8 @@ audio.set_levels(wind, [0.2, 0.6], Duration::from_millis(80)); // left, right, s
 // Beds are voices: music_pause and music_reset leave them playing.
 
 audio.set_music_gain(0.5, Duration::from_millis(300));          // a music fader
+audio.music_pause_fading(Duration::from_millis(45));            // fade out, then pause
+audio.music_resume_fading(Duration::from_millis(45));           // resume, fade back in
 audio.transition_to_section_with(cave, Quantize::Bars(4), SectionEntry {
     resume: true,      // pick the section up where it left off
     from_entry: true,  // count the 4 bars from when the sounding section entered
