@@ -1124,6 +1124,7 @@ fn music_holds_while_the_app_is_unfocused_or_suspended() {
         .add_message::<AppLifecycle>();
     let config = TonoConfig {
         pause_music_on_focus_loss: true,
+        focus_fade: std::time::Duration::ZERO,
         ..TonoConfig::default()
     };
     install(&mut app, audio.clone(), &config);
@@ -1215,4 +1216,79 @@ fn headless_output_runs_the_mixer_without_a_device() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(audio.music_beats() > 0.0);
+}
+
+#[test]
+fn a_fading_pause_lands_when_the_fade_does() {
+    use std::time::Duration;
+
+    let (audio, mut mixer) = manual();
+    audio.music_layer(&pad(), 0.0);
+    pull(&mut mixer, 1_000);
+    audio.music_pause_fading(Duration::from_millis(50)); // 2 400 frames
+    assert!(audio.music_is_paused(), "reads paused at once");
+    let fade = pull(&mut mixer, 3_000); // the fade lands mid-block
+    assert!(
+        peak(&fade[..200]) > 0.05,
+        "still audible as the fade starts"
+    );
+    for (f, pair) in fade.as_chunks::<2>().0.iter().enumerate().skip(1) {
+        let jump = (pair[0] - fade[(f - 1) * 2]).abs();
+        assert!(jump < 0.1, "no click at frame {f}: {jump}");
+    }
+    assert_eq!(peak(&fade[2_400 * 2..]), 0.0, "silent once it lands");
+    assert_eq!(
+        audio.music_position_frames(),
+        1_000 + 2_400,
+        "paused on the frame the fade landed"
+    );
+    pull(&mut mixer, 1_000);
+    assert_eq!(audio.music_position_frames(), 3_400, "and held there");
+
+    audio.music_resume_fading(Duration::from_millis(50));
+    let back = pull(&mut mixer, 2_400);
+    assert!(
+        peak(&back[..100]) < peak(&back[2_200..]),
+        "it fades back in"
+    );
+    assert_eq!(audio.music_position_frames(), 5_800, "from where it held");
+    assert!(!audio.music_is_paused());
+
+    // Resuming mid-fade turns the fade around without pausing.
+    audio.music_pause_fading(Duration::from_millis(50));
+    pull(&mut mixer, 1_200);
+    audio.music_resume_fading(Duration::from_millis(50));
+    pull(&mut mixer, 4_000);
+    assert_eq!(audio.music_position_frames(), 5_800 + 5_200, "never paused");
+    assert!(peak(&pull(&mut mixer, 512)) > 0.05);
+}
+
+#[test]
+fn focus_loss_fades_before_it_holds() {
+    use bevy::window::WindowFocused;
+
+    let (audio, mut mixer) = manual();
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .add_message::<WindowFocused>();
+    let config = TonoConfig {
+        pause_music_on_focus_loss: true,
+        ..TonoConfig::default()
+    };
+    assert_eq!(config.focus_fade, std::time::Duration::from_millis(45));
+    install(&mut app, audio.clone(), &config);
+    audio.music_layer(&pad(), 0.0);
+    pull(&mut mixer, 1_000);
+    app.world_mut().write_message(WindowFocused {
+        window: Entity::PLACEHOLDER,
+        focused: false,
+    });
+    app.update();
+    let fade = pull(&mut mixer, 4_000);
+    assert!(peak(&fade[..200]) > 0.05, "it fades rather than cuts");
+    assert_eq!(
+        audio.music_position_frames(),
+        1_000 + 2_160,
+        "held after 45 ms"
+    );
 }

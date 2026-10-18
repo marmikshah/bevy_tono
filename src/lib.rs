@@ -629,13 +629,34 @@ impl TonoAudio {
     /// seamlessly.
     pub fn music_pause(&self) {
         self.inner.state.paused.store(true, Ordering::Release);
-        self.send(Command::Pause(true));
+        self.send(Command::Pause(true, 0));
     }
 
     /// Resume the music bed from a [`music_pause`](Self::music_pause).
     pub fn music_resume(&self) {
         self.inner.state.paused.store(false, Ordering::Release);
-        self.send(Command::Pause(false));
+        self.send(Command::Pause(false, 0));
+    }
+
+    /// Fade the music bed out over `fade`, then pause it. The audio thread
+    /// pauses it on the frame the fade reaches silence, so the bed holds
+    /// exactly there and nothing clicks. The clock keeps running through the
+    /// fade. [`music_is_paused`](Self::music_is_paused) reads true at once.
+    pub fn music_pause_fading(&self, fade: std::time::Duration) {
+        self.inner.state.paused.store(true, Ordering::Release);
+        self.send(Command::Pause(true, self.frames(fade)));
+    }
+
+    /// Resume the music bed and fade it back in over `fade`. A resume during
+    /// a fading pause turns the fade around from where it is.
+    pub fn music_resume_fading(&self, fade: std::time::Duration) {
+        self.inner.state.paused.store(false, Ordering::Release);
+        self.send(Command::Pause(false, self.frames(fade)));
+    }
+
+    /// `duration` in frames at the device rate.
+    fn frames(&self, duration: std::time::Duration) -> u32 {
+        (duration.as_secs_f64() * self.inner.sample_rate as f64).round() as u32
     }
 
     /// Whether the music bed is currently paused.
@@ -1003,7 +1024,7 @@ fn drain_notes(
 ///     })
 ///     .add_plugins(TonoPlugin);
 /// ```
-#[derive(Resource, Clone, Debug, Default)]
+#[derive(Resource, Clone, Debug)]
 pub struct TonoConfig {
     /// A peak limiter on the final mix, so coincident loud cues bend under a
     /// ceiling instead of clipping. Off by default.
@@ -1014,8 +1035,23 @@ pub struct TonoConfig {
     /// the game left it, and [`music_is_paused`](TonoAudio::music_is_paused)
     /// reports only that. SFX and beds keep playing. Off by default.
     pub pause_music_on_focus_loss: bool,
+    /// How long the music fades out before that hold, and back in after it
+    /// (as [`music_pause_fading`](TonoAudio::music_pause_fading)). 45 ms by
+    /// default; zero holds at once.
+    pub focus_fade: std::time::Duration,
     /// Where the mix goes: the default output device, or nowhere.
     pub output: Output,
+}
+
+impl Default for TonoConfig {
+    fn default() -> Self {
+        TonoConfig {
+            limiter: None,
+            pause_music_on_focus_loss: false,
+            focus_fade: std::time::Duration::from_millis(45),
+            output: Output::Device,
+        }
+    }
 }
 
 /// Where [`TonoPlugin`] sends the mix.
@@ -1076,38 +1112,48 @@ fn install(app: &mut App, audio: TonoAudio, config: &TonoConfig) {
     if config.pause_music_on_focus_loss {
         use bevy::ecs::message::Messages;
         use bevy::window::{AppLifecycle, WindowFocused};
+        let fade = app
+            .world()
+            .resource::<TonoAudio>()
+            .frames(config.focus_fade);
         app.add_systems(
             PreUpdate,
             (
-                follow_focus.run_if(resource_exists::<Messages<WindowFocused>>),
-                follow_lifecycle.run_if(resource_exists::<Messages<AppLifecycle>>),
+                follow_focus(fade).run_if(resource_exists::<Messages<WindowFocused>>),
+                follow_lifecycle(fade).run_if(resource_exists::<Messages<AppLifecycle>>),
             ),
         );
     }
 }
 
-/// Hold the music while the window is unfocused.
-fn follow_focus(mut focus: MessageReader<bevy::window::WindowFocused>, audio: Res<TonoAudio>) {
-    if let Some(e) = focus.read().last() {
-        audio.send(Command::Suspend(!e.focused));
+/// Hold the music while the window is unfocused, fading over `fade` frames.
+fn follow_focus(
+    fade: u32,
+) -> impl FnMut(MessageReader<bevy::window::WindowFocused>, Res<TonoAudio>) {
+    move |mut focus, audio| {
+        if let Some(e) = focus.read().last() {
+            audio.send(Command::Suspend(!e.focused, fade));
+        }
     }
 }
 
 /// Hold the music while the app is suspended (sent to the background).
+/// Suspension may stop the device at once, so the fade is best effort there.
 fn follow_lifecycle(
-    mut lifecycle: MessageReader<bevy::window::AppLifecycle>,
-    audio: Res<TonoAudio>,
-) {
+    fade: u32,
+) -> impl FnMut(MessageReader<bevy::window::AppLifecycle>, Res<TonoAudio>) {
     use bevy::window::AppLifecycle;
-    for e in lifecycle.read() {
-        match e {
-            AppLifecycle::WillSuspend | AppLifecycle::Suspended => {
-                audio.send(Command::Suspend(true));
+    move |mut lifecycle, audio| {
+        for e in lifecycle.read() {
+            match e {
+                AppLifecycle::WillSuspend | AppLifecycle::Suspended => {
+                    audio.send(Command::Suspend(true, fade));
+                }
+                AppLifecycle::WillResume | AppLifecycle::Running => {
+                    audio.send(Command::Suspend(false, fade));
+                }
+                AppLifecycle::Idle => {}
             }
-            AppLifecycle::WillResume | AppLifecycle::Running => {
-                audio.send(Command::Suspend(false));
-            }
-            AppLifecycle::Idle => {}
         }
     }
 }
