@@ -1,4 +1,4 @@
-# Canonical Rust CI. Mirrors the local gate (make pre-commit-checks + test).
+# PR gate: what the git hooks run (make pre-commit-checks + test).
 # release.yml calls it as its gate on the commit being released.
 name: CI
 
@@ -8,7 +8,7 @@ on:
   workflow_call:
 
 jobs:
-  checks:
+  ci:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     steps:
@@ -23,16 +23,4 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: make pre-commit-checks
-
-  tests:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Linux build deps for Bevy
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - run: make test
