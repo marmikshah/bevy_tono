@@ -3,12 +3,13 @@
 //! which the mixer publishes after every block. Nothing here renders a
 //! `SoundDoc`: every render happens on the sending side, before the command.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::{Limiter, TonoConfig};
+use crate::sections::{Sections, SectionsLayer};
+use crate::{Limiter, SectionEntry, TonoConfig};
 use tono_core::adaptive::{AdaptiveMusic, LoopBuffer, Quantize, Stinger};
 use tono_core::dsl::{Node, SoundDoc};
 use tono_core::instrument::{Instrument, Note};
@@ -85,8 +86,8 @@ pub(crate) enum Command {
     Reset(u64),
     Tempo(f32, u32),
     Duck(f32, Duration),
-    Section(String, LoopBuffer),
-    Transition(usize, Quantize),
+    Section(LoopBuffer),
+    Transition(usize, Quantize, SectionEntry),
     Instrument(Box<Instrument>),
     NoteOn(usize, Note, f32),
     NoteOff(usize, Note),
@@ -142,6 +143,8 @@ pub(crate) struct Mixer {
     sample_rate: u32,
     pub(crate) engine: Engine,
     pub(crate) music: AdaptiveMusic,
+    /// The bed's first layer; only this thread touches it.
+    sections: Arc<Mutex<Sections>>,
     instruments: Vec<Instrument>,
     /// The engine instance behind each live `Voice` id.
     voices: Vec<(u64, InstanceHandle)>,
@@ -165,12 +168,17 @@ impl Mixer {
     ) -> Self {
         let mut engine = Engine::new(sample_rate);
         load_slot(&mut engine);
+        // The sections play as the bed's first layer, always at full gain.
+        let sections = Arc::new(Mutex::new(Sections::new(sample_rate)));
+        let mut music = AdaptiveMusic::new(sample_rate);
+        music.add_layer(SectionsLayer(sections.clone()), 0.0);
         Mixer {
             commands,
             state,
             sample_rate,
             engine,
-            music: AdaptiveMusic::new(sample_rate),
+            music,
+            sections,
             instruments: Vec::with_capacity(8),
             voices: Vec::with_capacity(64),
             sampled: Vec::with_capacity(64),
@@ -309,8 +317,9 @@ impl Mixer {
             Command::Layer(stem, fade_in_at) => {
                 self.music.add_layer(stem, fade_in_at);
             }
-            Command::Intensity(x) => self.music.set_intensity(x),
-            Command::IntensityAt(x, q) => self.music.set_intensity_at(x, q),
+            // NaN would switch every layer off, the sections with them.
+            Command::Intensity(x) => self.music.set_intensity(finite_or_zero(x)),
+            Command::IntensityAt(x, q) => self.music.set_intensity_at(finite_or_zero(x), q),
             Command::Stinger(stinger) => self.music.play_stinger(&stinger),
             Command::StingerAt(stinger, q) => self.music.play_stinger_at(&stinger, q),
             Command::Pause(true) => self.music.pause(),
@@ -319,12 +328,17 @@ impl Mixer {
                 self.music.reset();
                 self.reset_seen = epoch;
             }
-            Command::Tempo(bpm, beats_per_bar) => self.music.set_tempo(bpm, beats_per_bar),
-            Command::Duck(depth, release) => self.music.duck(depth, release),
-            Command::Section(name, buffer) => {
-                self.music.add_section_buffer(name, buffer);
+            Command::Tempo(bpm, beats_per_bar) => {
+                self.music.set_tempo(bpm, beats_per_bar);
+                crate::lock(&self.sections).set_tempo(bpm, beats_per_bar);
             }
-            Command::Transition(section, q) => self.music.transition_to(section, q),
+            Command::Duck(depth, release) => self.music.duck(depth, release),
+            Command::Section(buffer) => {
+                crate::lock(&self.sections).add(buffer);
+            }
+            Command::Transition(section, q, entry) => {
+                crate::lock(&self.sections).transition_to(section, q, entry);
+            }
             Command::Instrument(inst) => self.instruments.push(*inst),
             Command::NoteOn(i, note, velocity) => {
                 if let Some(inst) = self.instruments.get_mut(i) {
@@ -382,7 +396,7 @@ impl Mixer {
             .position
             .store(self.music.position_frames(), Ordering::Release);
         state.reset_seen.store(self.reset_seen, Ordering::Release);
-        let section = self.music.current_section().unwrap_or(NO_SECTION);
+        let section = crate::lock(&self.sections).current().unwrap_or(NO_SECTION);
         if section != self.published_section {
             self.published_section = section;
             state.current_section.store(section, Ordering::Release);
@@ -436,6 +450,10 @@ impl Ramp {
     pub(crate) fn at_target(&self) -> bool {
         self.remaining == 0
     }
+}
+
+fn finite_or_zero(x: f32) -> f32 {
+    if x.is_nan() { 0.0 } else { x }
 }
 
 /// `ms` milliseconds in frames, rounded as [`Tween::ms`] rounds.
